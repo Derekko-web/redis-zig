@@ -15,15 +15,20 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        var buffer: [1024]u8 = undefined;
-        while (true) {
-            const bytes_read = connection.stream.read(&buffer) catch 0;
-            if (bytes_read == 0) {
-                break;
-            }
-            try connection.stream.writeAll("+PONG\r\n");
-        }
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{connection});
+        thread.detach();
+    }
+}
 
-        connection.stream.close();
+fn handleConnection(connection: std.net.Server.Connection) !void {
+    defer connection.stream.close();
+
+    var buffer: [1024]u8 = undefined;
+    while (true) {
+        const bytes_read = connection.stream.read(&buffer) catch 0;
+        if (bytes_read == 0) {
+            break;
+        }
+        try connection.stream.writeAll("+PONG\r\n");
     }
 }
