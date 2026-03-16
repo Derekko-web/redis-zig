@@ -20,8 +20,8 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection");
 
-        try connection.stream.writer().writeAll("+PONG\r\n");
-        
+        try connection.stream.writeAll("+PONG\r\n");
+
         connection.stream.close();
     }
 }
