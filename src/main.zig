@@ -3,11 +3,6 @@ const stdout = std.fs.File.stdout();
 const net = std.net;
 
 pub fn main() !void {
-    // You can use print statements as follows for debugging, they'll be visible when running tests.
-    try stdout.writeAll("Logs from your program will appear here!");
-
-    // Uncomment the code below to pass the first stage
-
     const address = try net.Address.resolveIp("127.0.0.1", 6379);
 
     var listener = try address.listen(.{
@@ -18,9 +13,16 @@ pub fn main() !void {
     while (true) {
         const connection = try listener.accept();
 
-        try stdout.writeAll("accepted new connection");
+        try stdout.writeAll("accepted new connection\n");
 
-        try connection.stream.writeAll("+PONG\r\n");
+        var buffer: [1024]u8 = undefined;
+        while (true) {
+            const bytes_read = connection.stream.read(&buffer) catch 0;
+            if (bytes_read == 0) {
+                break;
+            }
+            try connection.stream.writeAll("+PONG\r\n");
+        }
 
         connection.stream.close();
     }
