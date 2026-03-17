@@ -74,14 +74,23 @@ const Database = struct {
         return null;
     }
 
-    fn rpush(self: *Database, key: []const u8, value: []const u8) !void {
+    fn rpush(self: *Database, key: []const u8, value: []const u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        var list_len: usize = 0;
+        for (self.lists.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                list_len += 1;
+            }
+        }
 
         try self.lists.append(self.allocator, .{
             .key = try self.allocator.dupe(u8, key),
             .value = try self.allocator.dupe(u8, value),
         });
+
+        return list_len + 1;
     }
 };
 
@@ -152,8 +161,11 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             const key = command.first_arg orelse continue;
             const value = command.second_arg orelse continue;
 
-            try database.rpush(key, value);
-            try connection.stream.writeAll(":1\r\n");
+            const list_len = try database.rpush(key, value);
+
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+            try connection.stream.writeAll(integer);
         }
     }
 }
