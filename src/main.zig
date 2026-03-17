@@ -16,15 +16,22 @@ const Entry = struct {
     expires_at_ms: ?i64,
 };
 
+const ListEntry = struct {
+    key: []u8,
+    value: []u8,
+};
+
 const Database = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry),
+    lists: std.ArrayList(ListEntry),
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator) Database {
         return .{
             .allocator = allocator,
             .entries = .empty,
+            .lists = .empty,
         };
     }
 
@@ -65,6 +72,16 @@ const Database = struct {
         }
 
         return null;
+    }
+
+    fn rpush(self: *Database, key: []const u8, value: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.lists.append(self.allocator, .{
+            .key = try self.allocator.dupe(u8, key),
+            .value = try self.allocator.dupe(u8, value),
+        });
     }
 };
 
@@ -131,6 +148,12 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             };
 
             try writeBulkString(connection.stream, value);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
+            const key = command.first_arg orelse continue;
+            const value = command.second_arg orelse continue;
+
+            try database.rpush(key, value);
+            try connection.stream.writeAll(":1\r\n");
         }
     }
 }
