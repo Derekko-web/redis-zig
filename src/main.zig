@@ -323,13 +323,39 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         } else if (std.ascii.eqlIgnoreCase(command.name, "lpop")) {
             if (command.arg_count < 1) continue;
             const key = command.args[0];
-            const value = database.lpop(key) orelse {
-                try connection.stream.writeAll("$-1\r\n");
-                continue;
-            };
 
-            defer database.allocator.free(value);
-            try writeBulkString(connection.stream, value);
+            if (command.arg_count > 1) {
+                const count = std.fmt.parseInt(usize, command.args[1], 10) catch continue;
+                var values: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (values.items) |value| {
+                        database.allocator.free(value);
+                    }
+                    values.deinit(database.allocator);
+                }
+
+                var index: usize = 0;
+                while (index < count) : (index += 1) {
+                    const value = database.lpop(key) orelse break;
+                    try values.append(database.allocator, value);
+                }
+
+                var header_buffer: [32]u8 = undefined;
+                const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{values.items.len});
+                try connection.stream.writeAll(header);
+
+                for (values.items) |value| {
+                    try writeBulkString(connection.stream, value);
+                }
+            } else {
+                const value = database.lpop(key) orelse {
+                    try connection.stream.writeAll("$-1\r\n");
+                    continue;
+                };
+
+                defer database.allocator.free(value);
+                try writeBulkString(connection.stream, value);
+            }
         }
     }
 }
