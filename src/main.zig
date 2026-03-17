@@ -6,11 +6,14 @@ const RespCommand = struct {
     name: []const u8,
     first_arg: ?[]const u8,
     second_arg: ?[]const u8,
+    third_arg: ?[]const u8,
+    fourth_arg: ?[]const u8,
 };
 
 const Entry = struct {
     key: []u8,
     value: []u8,
+    expires_at_ms: ?i64,
 };
 
 const Database = struct {
@@ -25,7 +28,7 @@ const Database = struct {
         };
     }
 
-    fn set(self: *Database, key: []const u8, value: []const u8) !void {
+    fn set(self: *Database, key: []const u8, value: []const u8, expires_at_ms: ?i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -33,6 +36,7 @@ const Database = struct {
             if (std.mem.eql(u8, entry.key, key)) {
                 self.allocator.free(entry.value);
                 entry.value = try self.allocator.dupe(u8, value);
+                entry.expires_at_ms = expires_at_ms;
                 return;
             }
         }
@@ -40,6 +44,7 @@ const Database = struct {
         try self.entries.append(self.allocator, .{
             .key = try self.allocator.dupe(u8, key),
             .value = try self.allocator.dupe(u8, value),
+            .expires_at_ms = expires_at_ms,
         });
     }
 
@@ -49,6 +54,12 @@ const Database = struct {
 
         for (self.entries.items) |entry| {
             if (std.mem.eql(u8, entry.key, key)) {
+                if (entry.expires_at_ms) |expires_at_ms| {
+                    if (std.time.milliTimestamp() >= expires_at_ms) {
+                        return null;
+                    }
+                }
+
                 return entry.value;
             }
         }
@@ -96,8 +107,21 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
             const key = command.first_arg orelse continue;
             const value = command.second_arg orelse continue;
+            var expires_at_ms: ?i64 = null;
 
-            try database.set(key, value);
+            if (command.third_arg != null or command.fourth_arg != null) {
+                const option = command.third_arg orelse continue;
+                const option_value = command.fourth_arg orelse continue;
+
+                if (!std.ascii.eqlIgnoreCase(option, "px")) {
+                    continue;
+                }
+
+                const ttl_ms = std.fmt.parseInt(i64, option_value, 10) catch continue;
+                expires_at_ms = std.time.milliTimestamp() + ttl_ms;
+            }
+
+            try database.set(key, value, expires_at_ms);
             try connection.stream.writeAll("+OK\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
             const key = command.first_arg orelse continue;
@@ -127,11 +151,15 @@ fn parseCommand(data: []const u8) ?RespCommand {
     const name = nextBulkString(&lines) orelse return null;
     const first_arg = if (element_count > 1) nextBulkString(&lines) else null;
     const second_arg = if (element_count > 2) nextBulkString(&lines) else null;
+    const third_arg = if (element_count > 3) nextBulkString(&lines) else null;
+    const fourth_arg = if (element_count > 4) nextBulkString(&lines) else null;
 
     return .{
         .name = name,
         .first_arg = first_arg,
         .second_arg = second_arg,
+        .third_arg = third_arg,
+        .fourth_arg = fourth_arg,
     };
 }
 
