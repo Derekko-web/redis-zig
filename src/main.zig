@@ -93,6 +93,46 @@ const Database = struct {
 
         return list_len + values.len;
     }
+
+    fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: usize, stop: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var list_len: usize = 0;
+        for (self.lists.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                list_len += 1;
+            }
+        }
+
+        if (list_len == 0 or start >= list_len or start > stop) {
+            try stream.writeAll("*0\r\n");
+            return;
+        }
+
+        const end = @min(stop, list_len - 1);
+        const result_len = end - start + 1;
+
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{result_len});
+        try stream.writeAll(header);
+
+        var list_index: usize = 0;
+        for (self.lists.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            if (list_index >= start and list_index <= end) {
+                try writeBulkString(stream, entry.value);
+            }
+
+            list_index += 1;
+            if (list_index > end) {
+                break;
+            }
+        }
+    }
 };
 
 pub fn main() !void {
@@ -171,6 +211,13 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
             try connection.stream.writeAll(integer);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "lrange")) {
+            if (command.arg_count < 3) continue;
+            const key = command.args[0];
+            const start = std.fmt.parseInt(usize, command.args[1], 10) catch continue;
+            const stop = std.fmt.parseInt(usize, command.args[2], 10) catch continue;
+
+            try database.writeLRange(connection.stream, key, start, stop);
         }
     }
 }
