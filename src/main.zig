@@ -94,7 +94,7 @@ const Database = struct {
         return list_len + values.len;
     }
 
-    fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: usize, stop: usize) !void {
+    fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -105,13 +105,40 @@ const Database = struct {
             }
         }
 
-        if (list_len == 0 or start >= list_len or start > stop) {
+        if (list_len == 0) {
             try stream.writeAll("*0\r\n");
             return;
         }
 
-        const end = @min(stop, list_len - 1);
-        const result_len = end - start + 1;
+        const list_len_i64: i64 = @intCast(list_len);
+        var resolved_start = start;
+        if (resolved_start < 0) {
+            resolved_start += list_len_i64;
+        }
+        if (resolved_start < 0) {
+            resolved_start = 0;
+        }
+
+        var resolved_stop = stop;
+        if (resolved_stop < 0) {
+            resolved_stop += list_len_i64;
+        }
+        if (resolved_stop < 0) {
+            resolved_stop = 0;
+        }
+
+        if (resolved_start >= list_len_i64 or resolved_start > resolved_stop) {
+            try stream.writeAll("*0\r\n");
+            return;
+        }
+
+        if (resolved_stop >= list_len_i64) {
+            resolved_stop = list_len_i64 - 1;
+        }
+
+        const range_start: usize = @intCast(resolved_start);
+        const range_end: usize = @intCast(resolved_stop);
+        const result_len = range_end - range_start + 1;
 
         var header_buffer: [32]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{result_len});
@@ -123,12 +150,12 @@ const Database = struct {
                 continue;
             }
 
-            if (list_index >= start and list_index <= end) {
+            if (list_index >= range_start and list_index <= range_end) {
                 try writeBulkString(stream, entry.value);
             }
 
             list_index += 1;
-            if (list_index > end) {
+            if (list_index > range_end) {
                 break;
             }
         }
@@ -214,8 +241,8 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         } else if (std.ascii.eqlIgnoreCase(command.name, "lrange")) {
             if (command.arg_count < 3) continue;
             const key = command.args[0];
-            const start = std.fmt.parseInt(usize, command.args[1], 10) catch continue;
-            const stop = std.fmt.parseInt(usize, command.args[2], 10) catch continue;
+            const start = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
+            const stop = std.fmt.parseInt(i64, command.args[2], 10) catch continue;
 
             try database.writeLRange(connection.stream, key, start, stop);
         }
