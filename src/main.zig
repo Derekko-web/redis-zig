@@ -152,13 +152,6 @@ const Database = struct {
         return list_len;
     }
 
-    fn addBlpopWaiter(self: *Database, waiter: *BlpopWaiter) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
-        try self.waiters.append(self.allocator, waiter);
-    }
-
     fn wakeBlpopWaiterLocked(self: *Database, key: []const u8, value: []const u8) !bool {
         for (self.waiters.items, 0..) |waiter, index| {
             if (std.mem.eql(u8, waiter.key, key)) {
@@ -175,6 +168,36 @@ const Database = struct {
         }
 
         return false;
+    }
+
+    fn removeBlpopWaiter(self: *Database, waiter: *BlpopWaiter) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.waiters.items, 0..) |queued_waiter, index| {
+            if (queued_waiter == waiter) {
+                _ = self.waiters.orderedRemove(index);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn beginBlpop(self: *Database, key: []const u8, waiter: *BlpopWaiter) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.lists.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                const removed = self.lists.orderedRemove(index);
+                self.allocator.free(removed.key);
+                return removed.value;
+            }
+        }
+
+        try self.waiters.append(self.allocator, waiter);
+        return null;
     }
 
     fn lpop(self: *Database, key: []const u8) ?[]u8 {
@@ -399,12 +422,33 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         } else if (std.ascii.eqlIgnoreCase(command.name, "blpop")) {
             if (command.arg_count < 2) continue;
             const key = command.args[0];
-            const timeout = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
-            if (timeout != 0) continue;
+            const timeout_seconds = std.fmt.parseFloat(f64, command.args[1]) catch continue;
+            if (timeout_seconds < 0) continue;
 
-            if (database.lpop(key)) |value| {
-                defer database.allocator.free(value);
-                try writeBlpopResponse(connection.stream, key, value);
+            if (timeout_seconds > 0) {
+                const timeout_ms: i64 = @intFromFloat(timeout_seconds * 1000.0);
+                const deadline = std.time.milliTimestamp() + timeout_ms;
+                var got_value = false;
+
+                while (std.time.milliTimestamp() < deadline) {
+                    if (database.lpop(key)) |value| {
+                        defer database.allocator.free(value);
+                        try writeBlpopResponse(connection.stream, key, value);
+                        got_value = true;
+                        break;
+                    }
+
+                    std.Thread.sleep(std.time.ns_per_ms);
+                }
+
+                if (!got_value) {
+                    if (database.lpop(key)) |value| {
+                        defer database.allocator.free(value);
+                        try writeBlpopResponse(connection.stream, key, value);
+                    } else {
+                        try connection.stream.writeAll("*-1\r\n");
+                    }
+                }
                 continue;
             }
 
@@ -416,7 +460,11 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             waiter.mutex.lock();
             defer waiter.mutex.unlock();
 
-            try database.addBlpopWaiter(&waiter);
+            if (try database.beginBlpop(key, &waiter)) |value| {
+                defer database.allocator.free(value);
+                try writeBlpopResponse(connection.stream, key, value);
+                continue;
+            }
 
             while (!waiter.ready) {
                 waiter.condition.wait(&waiter.mutex);
