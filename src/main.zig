@@ -20,10 +20,19 @@ const ListEntry = struct {
     value: []u8,
 };
 
+const BlpopWaiter = struct {
+    key: []u8,
+    mutex: std.Thread.Mutex = .{},
+    condition: std.Thread.Condition = .{},
+    ready: bool = false,
+    value: ?[]u8 = null,
+};
+
 const Database = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry),
     lists: std.ArrayList(ListEntry),
+    waiters: std.ArrayList(*BlpopWaiter),
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator) Database {
@@ -31,6 +40,7 @@ const Database = struct {
             .allocator = allocator,
             .entries = .empty,
             .lists = .empty,
+            .waiters = .empty,
         };
     }
 
@@ -84,7 +94,12 @@ const Database = struct {
             }
         }
 
-        for (values) |value| {
+        var start_index: usize = 0;
+        if (values.len > 0 and try self.wakeBlpopWaiterLocked(key, values[0])) {
+            start_index = 1;
+        }
+
+        for (values[start_index..]) |value| {
             try self.lists.append(self.allocator, .{
                 .key = try self.allocator.dupe(u8, key),
                 .value = try self.allocator.dupe(u8, value),
@@ -135,6 +150,31 @@ const Database = struct {
         }
 
         return list_len;
+    }
+
+    fn addBlpopWaiter(self: *Database, waiter: *BlpopWaiter) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try self.waiters.append(self.allocator, waiter);
+    }
+
+    fn wakeBlpopWaiterLocked(self: *Database, key: []const u8, value: []const u8) !bool {
+        for (self.waiters.items, 0..) |waiter, index| {
+            if (std.mem.eql(u8, waiter.key, key)) {
+                _ = self.waiters.orderedRemove(index);
+
+                waiter.mutex.lock();
+                defer waiter.mutex.unlock();
+
+                waiter.value = try self.allocator.dupe(u8, value);
+                waiter.ready = true;
+                waiter.condition.signal();
+                return true;
+            }
+        }
+
+        return false;
     }
 
     fn lpop(self: *Database, key: []const u8) ?[]u8 {
@@ -356,6 +396,35 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
                 defer database.allocator.free(value);
                 try writeBulkString(connection.stream, value);
             }
+        } else if (std.ascii.eqlIgnoreCase(command.name, "blpop")) {
+            if (command.arg_count < 2) continue;
+            const key = command.args[0];
+            const timeout = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
+            if (timeout != 0) continue;
+
+            if (database.lpop(key)) |value| {
+                defer database.allocator.free(value);
+                try writeBlpopResponse(connection.stream, key, value);
+                continue;
+            }
+
+            var waiter = BlpopWaiter{
+                .key = try database.allocator.dupe(u8, key),
+            };
+            defer database.allocator.free(waiter.key);
+
+            waiter.mutex.lock();
+            defer waiter.mutex.unlock();
+
+            try database.addBlpopWaiter(&waiter);
+
+            while (!waiter.ready) {
+                waiter.condition.wait(&waiter.mutex);
+            }
+
+            const value = waiter.value orelse continue;
+            defer database.allocator.free(value);
+            try writeBlpopResponse(connection.stream, waiter.key, value);
         }
     }
 }
@@ -414,4 +483,10 @@ fn writeBulkString(stream: anytype, value: []const u8) !void {
     try stream.writeAll(header);
     try stream.writeAll(value);
     try stream.writeAll("\r\n");
+}
+
+fn writeBlpopResponse(stream: anytype, key: []const u8, value: []const u8) !void {
+    try stream.writeAll("*2\r\n");
+    try writeBulkString(stream, key);
+    try writeBulkString(stream, value);
 }
