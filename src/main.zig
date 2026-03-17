@@ -123,6 +123,20 @@ const Database = struct {
         return list_len + values.len;
     }
 
+    fn llen(self: *Database, key: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var list_len: usize = 0;
+        for (self.lists.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                list_len += 1;
+            }
+        }
+
+        return list_len;
+    }
+
     fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -283,6 +297,14 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             const stop = std.fmt.parseInt(i64, command.args[2], 10) catch continue;
 
             try database.writeLRange(connection.stream, key, start, stop);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "llen")) {
+            if (command.arg_count < 1) continue;
+            const key = command.args[0];
+            const list_len = database.llen(key);
+
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+            try connection.stream.writeAll(integer);
         }
     }
 }
