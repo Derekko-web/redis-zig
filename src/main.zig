@@ -94,6 +94,35 @@ const Database = struct {
         return list_len + values.len;
     }
 
+    fn lpush(self: *Database, key: []const u8, values: []const []const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var list_len: usize = 0;
+        var insert_index = self.lists.items.len;
+        var found_first = false;
+
+        for (self.lists.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                list_len += 1;
+
+                if (!found_first) {
+                    insert_index = index;
+                    found_first = true;
+                }
+            }
+        }
+
+        for (values) |value| {
+            try self.lists.insert(self.allocator, insert_index, .{
+                .key = try self.allocator.dupe(u8, key),
+                .value = try self.allocator.dupe(u8, value),
+            });
+        }
+
+        return list_len + values.len;
+    }
+
     fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -234,6 +263,15 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             const key = command.args[0];
 
             const list_len = try database.rpush(key, command.args[1..command.arg_count]);
+
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+            try connection.stream.writeAll(integer);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "lpush")) {
+            if (command.arg_count < 2) continue;
+            const key = command.args[0];
+
+            const list_len = try database.lpush(key, command.args[1..command.arg_count]);
 
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
