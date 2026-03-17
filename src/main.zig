@@ -137,6 +137,21 @@ const Database = struct {
         return list_len;
     }
 
+    fn lpop(self: *Database, key: []const u8) ?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.lists.items, 0..) |entry, index| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                const removed = self.lists.orderedRemove(index);
+                self.allocator.free(removed.key);
+                return removed.value;
+            }
+        }
+
+        return null;
+    }
+
     fn writeLRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -305,6 +320,16 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
             try connection.stream.writeAll(integer);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "lpop")) {
+            if (command.arg_count < 1) continue;
+            const key = command.args[0];
+            const value = database.lpop(key) orelse {
+                try connection.stream.writeAll("$-1\r\n");
+                continue;
+            };
+
+            defer database.allocator.free(value);
+            try writeBulkString(connection.stream, value);
         }
     }
 }
