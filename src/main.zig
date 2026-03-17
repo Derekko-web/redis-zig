@@ -1,13 +1,12 @@
 const std = @import("std");
 const stdout = std.fs.File.stdout();
 const net = std.net;
+const max_command_args = 64;
 
 const RespCommand = struct {
     name: []const u8,
-    first_arg: ?[]const u8,
-    second_arg: ?[]const u8,
-    third_arg: ?[]const u8,
-    fourth_arg: ?[]const u8,
+    args: [max_command_args][]const u8,
+    arg_count: usize,
 };
 
 const Entry = struct {
@@ -74,7 +73,7 @@ const Database = struct {
         return null;
     }
 
-    fn rpush(self: *Database, key: []const u8, value: []const u8) !usize {
+    fn rpush(self: *Database, key: []const u8, values: []const []const u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -85,12 +84,14 @@ const Database = struct {
             }
         }
 
-        try self.lists.append(self.allocator, .{
-            .key = try self.allocator.dupe(u8, key),
-            .value = try self.allocator.dupe(u8, value),
-        });
+        for (values) |value| {
+            try self.lists.append(self.allocator, .{
+                .key = try self.allocator.dupe(u8, key),
+                .value = try self.allocator.dupe(u8, value),
+            });
+        }
 
-        return list_len + 1;
+        return list_len + values.len;
     }
 };
 
@@ -128,16 +129,19 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
             try connection.stream.writeAll("+PONG\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
-            const message = command.first_arg orelse continue;
+            if (command.arg_count < 1) continue;
+            const message = command.args[0];
             try writeBulkString(connection.stream, message);
         } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
-            const key = command.first_arg orelse continue;
-            const value = command.second_arg orelse continue;
+            if (command.arg_count < 2) continue;
+            const key = command.args[0];
+            const value = command.args[1];
             var expires_at_ms: ?i64 = null;
 
-            if (command.third_arg != null or command.fourth_arg != null) {
-                const option = command.third_arg orelse continue;
-                const option_value = command.fourth_arg orelse continue;
+            if (command.arg_count > 2) {
+                if (command.arg_count < 4) continue;
+                const option = command.args[2];
+                const option_value = command.args[3];
 
                 if (!std.ascii.eqlIgnoreCase(option, "px")) {
                     continue;
@@ -150,7 +154,8 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             try database.set(key, value, expires_at_ms);
             try connection.stream.writeAll("+OK\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
-            const key = command.first_arg orelse continue;
+            if (command.arg_count < 1) continue;
+            const key = command.args[0];
             const value = database.get(key) orelse {
                 try connection.stream.writeAll("$-1\r\n");
                 continue;
@@ -158,10 +163,10 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
 
             try writeBulkString(connection.stream, value);
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
-            const key = command.first_arg orelse continue;
-            const value = command.second_arg orelse continue;
+            if (command.arg_count < 2) continue;
+            const key = command.args[0];
 
-            const list_len = try database.rpush(key, value);
+            const list_len = try database.rpush(key, command.args[1..command.arg_count]);
 
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
@@ -183,18 +188,22 @@ fn parseCommand(data: []const u8) ?RespCommand {
         return null;
     }
 
+    if (element_count - 1 > max_command_args) {
+        return null;
+    }
+
     const name = nextBulkString(&lines) orelse return null;
-    const first_arg = if (element_count > 1) nextBulkString(&lines) else null;
-    const second_arg = if (element_count > 2) nextBulkString(&lines) else null;
-    const third_arg = if (element_count > 3) nextBulkString(&lines) else null;
-    const fourth_arg = if (element_count > 4) nextBulkString(&lines) else null;
+    var args: [max_command_args][]const u8 = undefined;
+    var arg_count: usize = 0;
+
+    while (arg_count < element_count - 1) : (arg_count += 1) {
+        args[arg_count] = nextBulkString(&lines) orelse return null;
+    }
 
     return .{
         .name = name,
-        .first_arg = first_arg,
-        .second_arg = second_arg,
-        .third_arg = third_arg,
-        .fourth_arg = fourth_arg,
+        .args = args,
+        .arg_count = arg_count,
     };
 }
 
