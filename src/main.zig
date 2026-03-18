@@ -443,6 +443,20 @@ const Database = struct {
         return result_len;
     }
 
+    fn hasXReadEntries(self: *Database, keys: []const []const u8, start_ids: []const StreamId) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var stream_index: usize = 0;
+        while (stream_index < keys.len) : (stream_index += 1) {
+            if (self.countXReadEntriesLocked(keys[stream_index], start_ids[stream_index]) > 0) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     fn writeXRead(self: *Database, stream: anytype, keys: []const []const u8, start_ids: []const StreamId) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -641,24 +655,62 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             try database.writeXRange(connection.stream, key, start_id, end_id);
         } else if (std.ascii.eqlIgnoreCase(command.name, "xread")) {
             if (command.arg_count < 3) continue;
-            if (!std.ascii.eqlIgnoreCase(command.args[0], "streams")) continue;
+            var block_timeout_ms: ?i64 = null;
+            var streams_index: usize = 0;
 
-            if ((command.arg_count - 1) % 2 != 0) continue;
+            if (std.ascii.eqlIgnoreCase(command.args[0], "block")) {
+                if (command.arg_count < 5) continue;
 
-            const stream_count = (command.arg_count - 1) / 2;
-            const keys = command.args[1 .. 1 + stream_count];
+                const parsed_timeout_ms = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
+                if (parsed_timeout_ms < 0) continue;
+
+                block_timeout_ms = parsed_timeout_ms;
+                streams_index = 2;
+            }
+
+            if (!std.ascii.eqlIgnoreCase(command.args[streams_index], "streams")) continue;
+
+            if ((command.arg_count - streams_index - 1) % 2 != 0) continue;
+
+            const stream_count = (command.arg_count - streams_index - 1) / 2;
+            const keys = command.args[streams_index + 1 .. streams_index + 1 + stream_count];
             var start_ids: [max_command_args]StreamId = undefined;
             var stream_index: usize = 0;
             var valid = true;
 
             while (stream_index < stream_count) : (stream_index += 1) {
-                start_ids[stream_index] = parseStreamId(command.args[1 + stream_count + stream_index]) orelse {
+                start_ids[stream_index] = parseStreamId(command.args[streams_index + 1 + stream_count + stream_index]) orelse {
                     valid = false;
                     break;
                 };
             }
 
             if (!valid) continue;
+
+            if (block_timeout_ms) |timeout_ms| {
+                if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                    if (timeout_ms == 0) {
+                        while (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                            std.Thread.sleep(std.time.ns_per_ms);
+                        }
+                    } else {
+                        const deadline = std.time.milliTimestamp() + timeout_ms;
+
+                        while (std.time.milliTimestamp() < deadline) {
+                            if (database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                                break;
+                            }
+
+                            std.Thread.sleep(std.time.ns_per_ms);
+                        }
+
+                        if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                            try connection.stream.writeAll("*-1\r\n");
+                            continue;
+                        }
+                    }
+                }
+            }
 
             try database.writeXRead(connection.stream, keys, start_ids[0..stream_count]);
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
