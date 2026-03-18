@@ -679,10 +679,19 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             var valid = true;
 
             while (stream_index < stream_count) : (stream_index += 1) {
-                start_ids[stream_index] = parseStreamId(command.args[streams_index + 1 + stream_count + stream_index]) orelse {
-                    valid = false;
-                    break;
-                };
+                const raw_start_id = command.args[streams_index + 1 + stream_count + stream_index];
+
+                if (std.mem.eql(u8, raw_start_id, "$")) {
+                    start_ids[stream_index] = database.getLastStreamId(keys[stream_index]) orelse .{
+                        .milliseconds_time = 0,
+                        .sequence_number = 0,
+                    };
+                } else {
+                    start_ids[stream_index] = parseStreamId(raw_start_id) orelse {
+                        valid = false;
+                        break;
+                    };
+                }
             }
 
             if (!valid) continue;
