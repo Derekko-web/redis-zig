@@ -31,6 +31,11 @@ const StreamEntry = struct {
     fields: std.ArrayList(StreamField),
 };
 
+const StreamId = struct {
+    milliseconds_time: u64,
+    sequence_number: u64,
+};
+
 const BlpopWaiter = struct {
     key: []u8,
     mutex: std.Thread.Mutex = .{},
@@ -128,6 +133,22 @@ const Database = struct {
         }
 
         return false;
+    }
+
+    fn getLastStreamId(self: *Database, key: []const u8) ?StreamId {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var index = self.streams.items.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.streams.items[index];
+            if (std.mem.eql(u8, entry.key, key)) {
+                return parseStreamId(entry.id);
+            }
+        }
+
+        return null;
     }
 
     fn rpush(self: *Database, key: []const u8, values: []const []const u8) !usize {
@@ -414,6 +435,19 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
 
             const key = command.args[0];
             const id = command.args[1];
+            const stream_id = parseStreamId(id) orelse continue;
+
+            if (stream_id.milliseconds_time == 0 and stream_id.sequence_number == 0) {
+                try connection.stream.writeAll("-ERR The ID specified in XADD must be greater than 0-0\r\n");
+                continue;
+            }
+
+            if (database.getLastStreamId(key)) |last_stream_id| {
+                if (compareStreamIds(stream_id, last_stream_id) <= 0) {
+                    try connection.stream.writeAll("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+                    continue;
+                }
+            }
 
             try database.xadd(key, id, command.args[2..command.arg_count]);
             try writeBulkString(connection.stream, id);
@@ -589,6 +623,44 @@ fn nextBulkString(lines: anytype) ?[]const u8 {
     }
 
     return value;
+}
+
+fn parseStreamId(id: []const u8) ?StreamId {
+    var parts = std.mem.splitScalar(u8, id, '-');
+    const milliseconds_time_text = parts.next() orelse return null;
+    const sequence_number_text = parts.next() orelse return null;
+
+    if (parts.next() != null) {
+        return null;
+    }
+
+    const milliseconds_time = std.fmt.parseInt(u64, milliseconds_time_text, 10) catch return null;
+    const sequence_number = std.fmt.parseInt(u64, sequence_number_text, 10) catch return null;
+
+    return .{
+        .milliseconds_time = milliseconds_time,
+        .sequence_number = sequence_number,
+    };
+}
+
+fn compareStreamIds(left: StreamId, right: StreamId) i2 {
+    if (left.milliseconds_time < right.milliseconds_time) {
+        return -1;
+    }
+
+    if (left.milliseconds_time > right.milliseconds_time) {
+        return 1;
+    }
+
+    if (left.sequence_number < right.sequence_number) {
+        return -1;
+    }
+
+    if (left.sequence_number > right.sequence_number) {
+        return 1;
+    }
+
+    return 0;
 }
 
 fn writeBulkString(stream: anytype, value: []const u8) !void {
