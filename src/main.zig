@@ -776,6 +776,13 @@ fn parseXRangeId(id: []const u8, is_start: bool) ?StreamId {
         };
     }
 
+    if (!is_start and std.mem.eql(u8, id, "+")) {
+        return .{
+            .milliseconds_time = std.math.maxInt(u64),
+            .sequence_number = std.math.maxInt(u64),
+        };
+    }
+
     var parts = std.mem.splitScalar(u8, id, '-');
     const milliseconds_time_text = parts.next() orelse return null;
     const maybe_sequence_number_text = parts.next();
