@@ -425,10 +425,7 @@ const Database = struct {
         }
     }
 
-    fn writeXRead(self: *Database, stream: anytype, key: []const u8, start_id: StreamId) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-
+    fn countXReadEntriesLocked(self: *Database, key: []const u8, start_id: StreamId) usize {
         var result_len: usize = 0;
         for (self.streams.items) |entry| {
             if (!std.mem.eql(u8, entry.key, key)) {
@@ -443,39 +440,66 @@ const Database = struct {
             result_len += 1;
         }
 
-        if (result_len == 0) {
+        return result_len;
+    }
+
+    fn writeXRead(self: *Database, stream: anytype, keys: []const []const u8, start_ids: []const StreamId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var stream_count: usize = 0;
+        var stream_index: usize = 0;
+        while (stream_index < keys.len) : (stream_index += 1) {
+            if (self.countXReadEntriesLocked(keys[stream_index], start_ids[stream_index]) > 0) {
+                stream_count += 1;
+            }
+        }
+
+        if (stream_count == 0) {
             try stream.writeAll("*-1\r\n");
             return;
         }
 
-        try stream.writeAll("*1\r\n");
-        try stream.writeAll("*2\r\n");
-        try writeBulkString(stream, key);
-
         var header_buffer: [32]u8 = undefined;
-        const entries_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{result_len});
-        try stream.writeAll(entries_header);
+        const streams_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{stream_count});
+        try stream.writeAll(streams_header);
 
-        for (self.streams.items) |entry| {
-            if (!std.mem.eql(u8, entry.key, key)) {
-                continue;
-            }
-
-            const entry_id = parseStreamId(entry.id) orelse continue;
-            if (compareStreamIds(entry_id, start_id) <= 0) {
+        stream_index = 0;
+        while (stream_index < keys.len) : (stream_index += 1) {
+            const key = keys[stream_index];
+            const start_id = start_ids[stream_index];
+            const result_len = self.countXReadEntriesLocked(key, start_id);
+            if (result_len == 0) {
                 continue;
             }
 
             try stream.writeAll("*2\r\n");
-            try writeBulkString(stream, entry.id);
+            try writeBulkString(stream, key);
 
-            const field_count = entry.fields.items.len * 2;
-            const field_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{field_count});
-            try stream.writeAll(field_header);
+            const entries_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{result_len});
+            try stream.writeAll(entries_header);
 
-            for (entry.fields.items) |field| {
-                try writeBulkString(stream, field.field);
-                try writeBulkString(stream, field.value);
+            for (self.streams.items) |entry| {
+                if (!std.mem.eql(u8, entry.key, key)) {
+                    continue;
+                }
+
+                const entry_id = parseStreamId(entry.id) orelse continue;
+                if (compareStreamIds(entry_id, start_id) <= 0) {
+                    continue;
+                }
+
+                try stream.writeAll("*2\r\n");
+                try writeBulkString(stream, entry.id);
+
+                const field_count = entry.fields.items.len * 2;
+                const field_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{field_count});
+                try stream.writeAll(field_header);
+
+                for (entry.fields.items) |field| {
+                    try writeBulkString(stream, field.field);
+                    try writeBulkString(stream, field.value);
+                }
             }
         }
     }
@@ -619,10 +643,24 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             if (command.arg_count < 3) continue;
             if (!std.ascii.eqlIgnoreCase(command.args[0], "streams")) continue;
 
-            const key = command.args[1];
-            const start_id = parseStreamId(command.args[2]) orelse continue;
+            if ((command.arg_count - 1) % 2 != 0) continue;
 
-            try database.writeXRead(connection.stream, key, start_id);
+            const stream_count = (command.arg_count - 1) / 2;
+            const keys = command.args[1 .. 1 + stream_count];
+            var start_ids: [max_command_args]StreamId = undefined;
+            var stream_index: usize = 0;
+            var valid = true;
+
+            while (stream_index < stream_count) : (stream_index += 1) {
+                start_ids[stream_index] = parseStreamId(command.args[1 + stream_count + stream_index]) orelse {
+                    valid = false;
+                    break;
+                };
+            }
+
+            if (!valid) continue;
+
+            try database.writeXRead(connection.stream, keys, start_ids[0..stream_count]);
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
             if (command.arg_count < 2) continue;
             const key = command.args[0];
