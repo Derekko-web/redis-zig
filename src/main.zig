@@ -350,6 +350,15 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             };
 
             try writeBulkString(connection.stream, value);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "type")) {
+            if (command.arg_count < 1) continue;
+            const key = command.args[0];
+
+            if (database.get(key) != null) {
+                try connection.stream.writeAll("+string\r\n");
+            } else {
+                try connection.stream.writeAll("+none\r\n");
+            }
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
             if (command.arg_count < 2) continue;
             const key = command.args[0];
