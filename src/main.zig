@@ -101,6 +101,29 @@ const Database = struct {
         return null;
     }
 
+    fn incr(self: *Database, key: []const u8) !?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.entries.items) |*entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const current_number = std.fmt.parseInt(i64, entry.value, 10) catch return null;
+            const new_number = current_number + 1;
+
+            var value_buffer: [32]u8 = undefined;
+            const new_value = try std.fmt.bufPrint(&value_buffer, "{d}", .{new_number});
+
+            self.allocator.free(entry.value);
+            entry.value = try self.allocator.dupe(u8, new_value);
+            return new_number;
+        }
+
+        return null;
+    }
+
     fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -586,6 +609,14 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             };
 
             try writeBulkString(connection.stream, value);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
+            if (command.arg_count < 1) continue;
+            const key = command.args[0];
+            const new_number = try database.incr(key) orelse continue;
+
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{new_number});
+            try connection.stream.writeAll(integer);
         } else if (std.ascii.eqlIgnoreCase(command.name, "type")) {
             if (command.arg_count < 1) continue;
             const key = command.args[0];
