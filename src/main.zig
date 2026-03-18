@@ -20,6 +20,17 @@ const ListEntry = struct {
     value: []u8,
 };
 
+const StreamField = struct {
+    field: []u8,
+    value: []u8,
+};
+
+const StreamEntry = struct {
+    key: []u8,
+    id: []u8,
+    fields: std.ArrayList(StreamField),
+};
+
 const BlpopWaiter = struct {
     key: []u8,
     mutex: std.Thread.Mutex = .{},
@@ -32,6 +43,7 @@ const Database = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry),
     lists: std.ArrayList(ListEntry),
+    streams: std.ArrayList(StreamEntry),
     waiters: std.ArrayList(*BlpopWaiter),
     mutex: std.Thread.Mutex = .{},
 
@@ -40,6 +52,7 @@ const Database = struct {
             .allocator = allocator,
             .entries = .empty,
             .lists = .empty,
+            .streams = .empty,
             .waiters = .empty,
         };
     }
@@ -81,6 +94,40 @@ const Database = struct {
         }
 
         return null;
+    }
+
+    fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var stream_entry = StreamEntry{
+            .key = try self.allocator.dupe(u8, key),
+            .id = try self.allocator.dupe(u8, id),
+            .fields = .empty,
+        };
+
+        var index: usize = 0;
+        while (index + 1 < field_values.len) : (index += 2) {
+            try stream_entry.fields.append(self.allocator, .{
+                .field = try self.allocator.dupe(u8, field_values[index]),
+                .value = try self.allocator.dupe(u8, field_values[index + 1]),
+            });
+        }
+
+        try self.streams.append(self.allocator, stream_entry);
+    }
+
+    fn isStream(self: *Database, key: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.streams.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     fn rpush(self: *Database, key: []const u8, values: []const []const u8) !usize {
@@ -354,11 +401,22 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             if (command.arg_count < 1) continue;
             const key = command.args[0];
 
-            if (database.get(key) != null) {
+            if (database.isStream(key)) {
+                try connection.stream.writeAll("+stream\r\n");
+            } else if (database.get(key) != null) {
                 try connection.stream.writeAll("+string\r\n");
             } else {
                 try connection.stream.writeAll("+none\r\n");
             }
+        } else if (std.ascii.eqlIgnoreCase(command.name, "xadd")) {
+            if (command.arg_count < 4) continue;
+            if ((command.arg_count - 2) % 2 != 0) continue;
+
+            const key = command.args[0];
+            const id = command.args[1];
+
+            try database.xadd(key, id, command.args[2..command.arg_count]);
+            try writeBulkString(connection.stream, id);
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
             if (command.arg_count < 2) continue;
             const key = command.args[0];
