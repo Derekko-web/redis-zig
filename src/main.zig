@@ -101,7 +101,7 @@ const Database = struct {
         return null;
     }
 
-    fn incr(self: *Database, key: []const u8) !?i64 {
+    fn incr(self: *Database, key: []const u8) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -110,7 +110,7 @@ const Database = struct {
                 continue;
             }
 
-            const current_number = std.fmt.parseInt(i64, entry.value, 10) catch return null;
+            const current_number = std.fmt.parseInt(i64, entry.value, 10) catch return error.InvalidInteger;
             const new_number = current_number + 1;
 
             var value_buffer: [32]u8 = undefined;
@@ -618,7 +618,13 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
             if (command.arg_count < 1) continue;
             const key = command.args[0];
-            const new_number = try database.incr(key) orelse continue;
+            const new_number = database.incr(key) catch |err| switch (err) {
+                error.InvalidInteger => {
+                    try connection.stream.writeAll("-ERR value is not an integer or out of range\r\n");
+                    continue;
+                },
+                else => return err,
+            };
 
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{new_number});
