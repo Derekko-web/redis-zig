@@ -121,7 +121,13 @@ const Database = struct {
             return new_number;
         }
 
-        return null;
+        try self.entries.append(self.allocator, .{
+            .key = try self.allocator.dupe(u8, key),
+            .value = try self.allocator.dupe(u8, "1"),
+            .expires_at_ms = null,
+        });
+
+        return 1;
     }
 
     fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
