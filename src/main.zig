@@ -151,6 +151,27 @@ const Database = struct {
         return null;
     }
 
+    fn getLastStreamSequenceNumber(self: *Database, key: []const u8, milliseconds_time: u64) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var index = self.streams.items.len;
+        while (index > 0) {
+            index -= 1;
+            const entry = self.streams.items[index];
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const stream_id = parseStreamId(entry.id) orelse continue;
+            if (stream_id.milliseconds_time == milliseconds_time) {
+                return stream_id.sequence_number;
+            }
+        }
+
+        return null;
+    }
+
     fn rpush(self: *Database, key: []const u8, values: []const []const u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -434,7 +455,23 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             if ((command.arg_count - 2) % 2 != 0) continue;
 
             const key = command.args[0];
-            const id = command.args[1];
+            const requested_id = command.args[1];
+            var generated_id_buffer: [64]u8 = undefined;
+            const id = if (parseAutoSequenceMillisecondsTime(requested_id)) |milliseconds_time|
+                blk: {
+                    var sequence_number: u64 = 0;
+                    if (database.getLastStreamSequenceNumber(key, milliseconds_time)) |last_sequence_number| {
+                        sequence_number = last_sequence_number + 1;
+                    } else if (milliseconds_time == 0) {
+                        sequence_number = 1;
+                    }
+
+                    const generated_id = try std.fmt.bufPrint(&generated_id_buffer, "{d}-{d}", .{ milliseconds_time, sequence_number });
+                    break :blk generated_id;
+                }
+            else
+                requested_id;
+
             const stream_id = parseStreamId(id) orelse continue;
 
             if (stream_id.milliseconds_time == 0 and stream_id.sequence_number == 0) {
@@ -641,6 +678,22 @@ fn parseStreamId(id: []const u8) ?StreamId {
         .milliseconds_time = milliseconds_time,
         .sequence_number = sequence_number,
     };
+}
+
+fn parseAutoSequenceMillisecondsTime(id: []const u8) ?u64 {
+    var parts = std.mem.splitScalar(u8, id, '-');
+    const milliseconds_time_text = parts.next() orelse return null;
+    const sequence_number_text = parts.next() orelse return null;
+
+    if (parts.next() != null) {
+        return null;
+    }
+
+    if (!std.mem.eql(u8, sequence_number_text, "*")) {
+        return null;
+    }
+
+    return std.fmt.parseInt(u64, milliseconds_time_text, 10) catch return null;
 }
 
 fn compareStreamIds(left: StreamId, right: StreamId) i2 {
