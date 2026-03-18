@@ -370,6 +370,60 @@ const Database = struct {
             }
         }
     }
+
+    fn writeXRange(self: *Database, stream: anytype, key: []const u8, start_id: StreamId, end_id: StreamId) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var result_len: usize = 0;
+        for (self.streams.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const entry_id = parseStreamId(entry.id) orelse continue;
+            if (compareStreamIds(entry_id, start_id) < 0) {
+                continue;
+            }
+
+            if (compareStreamIds(entry_id, end_id) > 0) {
+                continue;
+            }
+
+            result_len += 1;
+        }
+
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{result_len});
+        try stream.writeAll(header);
+
+        for (self.streams.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const entry_id = parseStreamId(entry.id) orelse continue;
+            if (compareStreamIds(entry_id, start_id) < 0) {
+                continue;
+            }
+
+            if (compareStreamIds(entry_id, end_id) > 0) {
+                continue;
+            }
+
+            try stream.writeAll("*2\r\n");
+            try writeBulkString(stream, entry.id);
+
+            const field_count = entry.fields.items.len * 2;
+            const field_header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{field_count});
+            try stream.writeAll(field_header);
+
+            for (entry.fields.items) |field| {
+                try writeBulkString(stream, field.field);
+                try writeBulkString(stream, field.value);
+            }
+        }
+    }
 };
 
 pub fn main() !void {
@@ -499,6 +553,13 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
 
             try database.xadd(key, id, command.args[2..command.arg_count]);
             try writeBulkString(connection.stream, id);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "xrange")) {
+            if (command.arg_count < 3) continue;
+            const key = command.args[0];
+            const start_id = parseXRangeId(command.args[1], true) orelse continue;
+            const end_id = parseXRangeId(command.args[2], false) orelse continue;
+
+            try database.writeXRange(connection.stream, key, start_id, end_id);
         } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
             if (command.arg_count < 2) continue;
             const key = command.args[0];
@@ -705,6 +766,29 @@ fn parseAutoSequenceMillisecondsTime(id: []const u8) ?u64 {
     }
 
     return std.fmt.parseInt(u64, milliseconds_time_text, 10) catch return null;
+}
+
+fn parseXRangeId(id: []const u8, is_start: bool) ?StreamId {
+    var parts = std.mem.splitScalar(u8, id, '-');
+    const milliseconds_time_text = parts.next() orelse return null;
+    const maybe_sequence_number_text = parts.next();
+
+    if (parts.next() != null) {
+        return null;
+    }
+
+    const milliseconds_time = std.fmt.parseInt(u64, milliseconds_time_text, 10) catch return null;
+    var sequence_number: u64 = 0;
+    if (maybe_sequence_number_text) |sequence_number_text| {
+        sequence_number = std.fmt.parseInt(u64, sequence_number_text, 10) catch return null;
+    } else if (!is_start) {
+        sequence_number = std.math.maxInt(u64);
+    }
+
+    return .{
+        .milliseconds_time = milliseconds_time,
+        .sequence_number = sequence_number,
+    };
 }
 
 fn compareStreamIds(left: StreamId, right: StreamId) i2 {
