@@ -803,6 +803,13 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
         try stream.writeAll("+PONG\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
         try stream.writeAll("+OK\r\n");
+    } else if (std.ascii.eqlIgnoreCase(command.name, "psync")) {
+        var fullresync_buffer: [96]u8 = undefined;
+        const fullresync = try std.fmt.bufPrint(&fullresync_buffer, "+FULLRESYNC {s} {d}\r\n", .{
+            default_master_replid,
+            default_master_repl_offset,
+        });
+        try stream.writeAll(fullresync);
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
             try writeInfoReplication(stream, role);
