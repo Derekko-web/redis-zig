@@ -9,6 +9,39 @@ const RespCommand = struct {
     arg_count: usize,
 };
 
+const QueuedCommand = struct {
+    name: []u8,
+    args: std.ArrayList([]u8),
+
+    fn init(allocator: std.mem.Allocator, command: RespCommand) !QueuedCommand {
+        var args: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (args.items) |arg| {
+                allocator.free(arg);
+            }
+            args.deinit(allocator);
+        }
+
+        var arg_index: usize = 0;
+        while (arg_index < command.arg_count) : (arg_index += 1) {
+            try args.append(allocator, try allocator.dupe(u8, command.args[arg_index]));
+        }
+
+        return .{
+            .name = try allocator.dupe(u8, command.name),
+            .args = args,
+        };
+    }
+
+    fn deinit(self: *QueuedCommand, allocator: std.mem.Allocator) void {
+        allocator.free(self.name);
+        for (self.args.items) |arg| {
+            allocator.free(arg);
+        }
+        self.args.deinit(allocator);
+    }
+};
+
 const Entry = struct {
     key: []u8,
     value: []u8,
