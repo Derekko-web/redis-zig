@@ -595,8 +595,27 @@ const Database = struct {
 };
 
 pub fn main() !void {
-    const address = try net.Address.resolveIp("127.0.0.1", 6379);
-    var database = Database.init(std.heap.page_allocator);
+    const allocator = std.heap.page_allocator;
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
+
+    var port: u16 = 6379;
+    var arg_index: usize = 1;
+    while (arg_index < args.len) : (arg_index += 1) {
+        if (!std.mem.eql(u8, args[arg_index], "--port")) {
+            continue;
+        }
+
+        arg_index += 1;
+        if (arg_index >= args.len) {
+            return error.MissingPortValue;
+        }
+
+        port = try std.fmt.parseInt(u16, args[arg_index], 10);
+    }
+
+    const address = try net.Address.resolveIp("127.0.0.1", port);
+    var database = Database.init(allocator);
 
     var listener = try address.listen(.{
         .reuse_address = true,
