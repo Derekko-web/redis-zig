@@ -2,6 +2,8 @@ const std = @import("std");
 const stdout = std.fs.File.stdout();
 const net = std.net;
 const max_command_args = 64;
+const default_master_replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+const default_master_repl_offset: u64 = 0;
 
 const ServerRole = enum {
     master,
@@ -710,10 +712,7 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
         try stream.writeAll("+PONG\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
-            try writeBulkString(stream, switch (role) {
-                .master => "role:master",
-                .slave => "role:slave",
-            });
+            try writeInfoReplication(stream, role);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
@@ -1011,6 +1010,22 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
         defer database.allocator.free(value);
         try writeBlpopResponse(stream, waiter.key, value);
     }
+}
+
+fn writeInfoReplication(stream: anytype, role: ServerRole) !void {
+    const role_name = switch (role) {
+        .master => "master",
+        .slave => "slave",
+    };
+
+    var info_buffer: [128]u8 = undefined;
+    const info = try std.fmt.bufPrint(&info_buffer, "role:{s}\r\nmaster_replid:{s}\r\nmaster_repl_offset:{d}", .{
+        role_name,
+        default_master_replid,
+        default_master_repl_offset,
+    });
+
+    try writeBulkString(stream, info);
 }
 
 fn parseCommand(data: []const u8) ?RespCommand {
