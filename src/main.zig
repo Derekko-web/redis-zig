@@ -571,6 +571,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
     defer connection.stream.close();
 
     var buffer: [1024]u8 = undefined;
+    var in_transaction = false;
     while (true) {
         const bytes_read = connection.stream.read(&buffer) catch 0;
         if (bytes_read == 0) {
@@ -582,7 +583,16 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
             try connection.stream.writeAll("+PONG\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "multi")) {
+            in_transaction = true;
             try connection.stream.writeAll("+OK\r\n");
+        } else if (std.ascii.eqlIgnoreCase(command.name, "exec")) {
+            if (!in_transaction) {
+                try connection.stream.writeAll("-ERR EXEC without MULTI\r\n");
+                continue;
+            }
+
+            in_transaction = false;
+            try connection.stream.writeAll("*0\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
             if (command.arg_count < 1) continue;
             const message = command.args[0];
