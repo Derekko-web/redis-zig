@@ -801,6 +801,8 @@ fn expectSimpleString(stream: anytype, expected: []const u8) !void {
 fn executeCommand(stream: anytype, database: *Database, role: ServerRole, command: RespCommand) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         try stream.writeAll("+PONG\r\n");
+    } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
+        try stream.writeAll("+OK\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
             try writeInfoReplication(stream, role);
