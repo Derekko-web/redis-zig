@@ -40,6 +40,19 @@ const QueuedCommand = struct {
         }
         self.args.deinit(allocator);
     }
+
+    fn toRespCommand(self: *const QueuedCommand) RespCommand {
+        var args: [max_command_args][]const u8 = undefined;
+        for (self.args.items, 0..) |arg, index| {
+            args[index] = arg;
+        }
+
+        return .{
+            .name = self.name,
+            .args = args,
+            .arg_count = self.args.items.len,
+        };
+    }
 };
 
 const Entry = struct {
@@ -618,15 +631,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
 
         const command = parseCommand(buffer[0..bytes_read]) orelse continue;
 
-        if (in_transaction and !std.ascii.eqlIgnoreCase(command.name, "exec")) {
-            try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
-            try connection.stream.writeAll("+QUEUED\r\n");
-            continue;
-        }
-
-        if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
-            try connection.stream.writeAll("+PONG\r\n");
-        } else if (std.ascii.eqlIgnoreCase(command.name, "multi")) {
+        if (std.ascii.eqlIgnoreCase(command.name, "multi")) {
             in_transaction = true;
             try connection.stream.writeAll("+OK\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "exec")) {
@@ -636,310 +641,20 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             }
 
             in_transaction = false;
+            var header_buffer: [32]u8 = undefined;
+            const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{queued_commands.items.len});
+            try connection.stream.writeAll(header);
+
+            for (queued_commands.items) |*queued_command| {
+                try executeCommand(connection.stream, database, queued_command.toRespCommand());
+            }
+
             clearQueuedCommands(database.allocator, &queued_commands);
-            try connection.stream.writeAll("*0\r\n");
-        } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
-            if (command.arg_count < 1) continue;
-            const message = command.args[0];
-            try writeBulkString(connection.stream, message);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
-            if (command.arg_count < 2) continue;
-            const key = command.args[0];
-            const value = command.args[1];
-            var expires_at_ms: ?i64 = null;
-
-            if (command.arg_count > 2) {
-                if (command.arg_count < 4) continue;
-                const option = command.args[2];
-                const option_value = command.args[3];
-
-                if (!std.ascii.eqlIgnoreCase(option, "px")) {
-                    continue;
-                }
-
-                const ttl_ms = std.fmt.parseInt(i64, option_value, 10) catch continue;
-                expires_at_ms = std.time.milliTimestamp() + ttl_ms;
-            }
-
-            try database.set(key, value, expires_at_ms);
-            try connection.stream.writeAll("+OK\r\n");
-        } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
-            if (command.arg_count < 1) continue;
-            const key = command.args[0];
-            const value = database.get(key) orelse {
-                try connection.stream.writeAll("$-1\r\n");
-                continue;
-            };
-
-            try writeBulkString(connection.stream, value);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
-            if (command.arg_count < 1) continue;
-            const key = command.args[0];
-            const new_number = database.incr(key) catch |err| switch (err) {
-                error.InvalidInteger => {
-                    try connection.stream.writeAll("-ERR value is not an integer or out of range\r\n");
-                    continue;
-                },
-                else => return err,
-            };
-
-            var integer_buffer: [32]u8 = undefined;
-            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{new_number});
-            try connection.stream.writeAll(integer);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "type")) {
-            if (command.arg_count < 1) continue;
-            const key = command.args[0];
-
-            if (database.isStream(key)) {
-                try connection.stream.writeAll("+stream\r\n");
-            } else if (database.get(key) != null) {
-                try connection.stream.writeAll("+string\r\n");
-            } else {
-                try connection.stream.writeAll("+none\r\n");
-            }
-        } else if (std.ascii.eqlIgnoreCase(command.name, "xadd")) {
-            if (command.arg_count < 4) continue;
-            if ((command.arg_count - 2) % 2 != 0) continue;
-
-            const key = command.args[0];
-            const requested_id = command.args[1];
-            var generated_id_buffer: [64]u8 = undefined;
-            const id = if (std.mem.eql(u8, requested_id, "*")) blk: {
-                const milliseconds_time: u64 = @intCast(std.time.milliTimestamp());
-                var sequence_number: u64 = 0;
-                if (database.getLastStreamSequenceNumber(key, milliseconds_time)) |last_sequence_number| {
-                    sequence_number = last_sequence_number + 1;
-                }
-
-                const generated_id = try std.fmt.bufPrint(&generated_id_buffer, "{d}-{d}", .{ milliseconds_time, sequence_number });
-                break :blk generated_id;
-            } else if (parseAutoSequenceMillisecondsTime(requested_id)) |milliseconds_time| blk: {
-                var sequence_number: u64 = 0;
-                if (database.getLastStreamSequenceNumber(key, milliseconds_time)) |last_sequence_number| {
-                    sequence_number = last_sequence_number + 1;
-                } else if (milliseconds_time == 0) {
-                    sequence_number = 1;
-                }
-
-                const generated_id = try std.fmt.bufPrint(&generated_id_buffer, "{d}-{d}", .{ milliseconds_time, sequence_number });
-                break :blk generated_id;
-            } else requested_id;
-
-            const stream_id = parseStreamId(id) orelse continue;
-
-            if (stream_id.milliseconds_time == 0 and stream_id.sequence_number == 0) {
-                try connection.stream.writeAll("-ERR The ID specified in XADD must be greater than 0-0\r\n");
-                continue;
-            }
-
-            if (database.getLastStreamId(key)) |last_stream_id| {
-                if (compareStreamIds(stream_id, last_stream_id) <= 0) {
-                    try connection.stream.writeAll("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
-                    continue;
-                }
-            }
-
-            try database.xadd(key, id, command.args[2..command.arg_count]);
-            try writeBulkString(connection.stream, id);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "xrange")) {
-            if (command.arg_count < 3) continue;
-            const key = command.args[0];
-            const start_id = parseXRangeId(command.args[1], true) orelse continue;
-            const end_id = parseXRangeId(command.args[2], false) orelse continue;
-
-            try database.writeXRange(connection.stream, key, start_id, end_id);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "xread")) {
-            if (command.arg_count < 3) continue;
-            var block_timeout_ms: ?i64 = null;
-            var streams_index: usize = 0;
-
-            if (std.ascii.eqlIgnoreCase(command.args[0], "block")) {
-                if (command.arg_count < 5) continue;
-
-                const parsed_timeout_ms = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
-                if (parsed_timeout_ms < 0) continue;
-
-                block_timeout_ms = parsed_timeout_ms;
-                streams_index = 2;
-            }
-
-            if (!std.ascii.eqlIgnoreCase(command.args[streams_index], "streams")) continue;
-
-            if ((command.arg_count - streams_index - 1) % 2 != 0) continue;
-
-            const stream_count = (command.arg_count - streams_index - 1) / 2;
-            const keys = command.args[streams_index + 1 .. streams_index + 1 + stream_count];
-            var start_ids: [max_command_args]StreamId = undefined;
-            var stream_index: usize = 0;
-            var valid = true;
-
-            while (stream_index < stream_count) : (stream_index += 1) {
-                const raw_start_id = command.args[streams_index + 1 + stream_count + stream_index];
-
-                if (std.mem.eql(u8, raw_start_id, "$")) {
-                    start_ids[stream_index] = database.getLastStreamId(keys[stream_index]) orelse .{
-                        .milliseconds_time = 0,
-                        .sequence_number = 0,
-                    };
-                } else {
-                    start_ids[stream_index] = parseStreamId(raw_start_id) orelse {
-                        valid = false;
-                        break;
-                    };
-                }
-            }
-
-            if (!valid) continue;
-
-            if (block_timeout_ms) |timeout_ms| {
-                if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
-                    if (timeout_ms == 0) {
-                        while (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
-                            std.Thread.sleep(std.time.ns_per_ms);
-                        }
-                    } else {
-                        const deadline = std.time.milliTimestamp() + timeout_ms;
-
-                        while (std.time.milliTimestamp() < deadline) {
-                            if (database.hasXReadEntries(keys, start_ids[0..stream_count])) {
-                                break;
-                            }
-
-                            std.Thread.sleep(std.time.ns_per_ms);
-                        }
-
-                        if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
-                            try connection.stream.writeAll("*-1\r\n");
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            try database.writeXRead(connection.stream, keys, start_ids[0..stream_count]);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
-            if (command.arg_count < 2) continue;
-            const key = command.args[0];
-
-            const list_len = try database.rpush(key, command.args[1..command.arg_count]);
-
-            var integer_buffer: [32]u8 = undefined;
-            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
-            try connection.stream.writeAll(integer);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "lpush")) {
-            if (command.arg_count < 2) continue;
-            const key = command.args[0];
-
-            const list_len = try database.lpush(key, command.args[1..command.arg_count]);
-
-            var integer_buffer: [32]u8 = undefined;
-            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
-            try connection.stream.writeAll(integer);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "lrange")) {
-            if (command.arg_count < 3) continue;
-            const key = command.args[0];
-            const start = std.fmt.parseInt(i64, command.args[1], 10) catch continue;
-            const stop = std.fmt.parseInt(i64, command.args[2], 10) catch continue;
-
-            try database.writeLRange(connection.stream, key, start, stop);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "llen")) {
-            if (command.arg_count < 1) continue;
-            const key = command.args[0];
-            const list_len = database.llen(key);
-
-            var integer_buffer: [32]u8 = undefined;
-            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
-            try connection.stream.writeAll(integer);
-        } else if (std.ascii.eqlIgnoreCase(command.name, "lpop")) {
-            if (command.arg_count < 1) continue;
-            const key = command.args[0];
-
-            if (command.arg_count > 1) {
-                const count = std.fmt.parseInt(usize, command.args[1], 10) catch continue;
-                var values: std.ArrayList([]u8) = .empty;
-                defer {
-                    for (values.items) |value| {
-                        database.allocator.free(value);
-                    }
-                    values.deinit(database.allocator);
-                }
-
-                var index: usize = 0;
-                while (index < count) : (index += 1) {
-                    const value = database.lpop(key) orelse break;
-                    try values.append(database.allocator, value);
-                }
-
-                var header_buffer: [32]u8 = undefined;
-                const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{values.items.len});
-                try connection.stream.writeAll(header);
-
-                for (values.items) |value| {
-                    try writeBulkString(connection.stream, value);
-                }
-            } else {
-                const value = database.lpop(key) orelse {
-                    try connection.stream.writeAll("$-1\r\n");
-                    continue;
-                };
-
-                defer database.allocator.free(value);
-                try writeBulkString(connection.stream, value);
-            }
-        } else if (std.ascii.eqlIgnoreCase(command.name, "blpop")) {
-            if (command.arg_count < 2) continue;
-            const key = command.args[0];
-            const timeout_seconds = std.fmt.parseFloat(f64, command.args[1]) catch continue;
-            if (timeout_seconds < 0) continue;
-
-            if (timeout_seconds > 0) {
-                const timeout_ms: i64 = @intFromFloat(timeout_seconds * 1000.0);
-                const deadline = std.time.milliTimestamp() + timeout_ms;
-                var got_value = false;
-
-                while (std.time.milliTimestamp() < deadline) {
-                    if (database.lpop(key)) |value| {
-                        defer database.allocator.free(value);
-                        try writeBlpopResponse(connection.stream, key, value);
-                        got_value = true;
-                        break;
-                    }
-
-                    std.Thread.sleep(std.time.ns_per_ms);
-                }
-
-                if (!got_value) {
-                    if (database.lpop(key)) |value| {
-                        defer database.allocator.free(value);
-                        try writeBlpopResponse(connection.stream, key, value);
-                    } else {
-                        try connection.stream.writeAll("*-1\r\n");
-                    }
-                }
-                continue;
-            }
-
-            var waiter = BlpopWaiter{
-                .key = try database.allocator.dupe(u8, key),
-            };
-            defer database.allocator.free(waiter.key);
-
-            waiter.mutex.lock();
-            defer waiter.mutex.unlock();
-
-            if (try database.beginBlpop(key, &waiter)) |value| {
-                defer database.allocator.free(value);
-                try writeBlpopResponse(connection.stream, key, value);
-                continue;
-            }
-
-            while (!waiter.ready) {
-                waiter.condition.wait(&waiter.mutex);
-            }
-
-            const value = waiter.value orelse continue;
-            defer database.allocator.free(value);
-            try writeBlpopResponse(connection.stream, waiter.key, value);
+        } else if (in_transaction) {
+            try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
+            try connection.stream.writeAll("+QUEUED\r\n");
+        } else {
+            try executeCommand(connection.stream, database, command);
         }
     }
 }
@@ -949,6 +664,307 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
         queued_command.deinit(allocator);
     }
     queued_commands.clearRetainingCapacity();
+}
+
+fn executeCommand(stream: anytype, database: *Database, command: RespCommand) !void {
+    if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
+        try stream.writeAll("+PONG\r\n");
+    } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
+        if (command.arg_count < 1) return;
+        const message = command.args[0];
+        try writeBulkString(stream, message);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
+        if (command.arg_count < 2) return;
+        const key = command.args[0];
+        const value = command.args[1];
+        var expires_at_ms: ?i64 = null;
+
+        if (command.arg_count > 2) {
+            if (command.arg_count < 4) return;
+            const option = command.args[2];
+            const option_value = command.args[3];
+
+            if (!std.ascii.eqlIgnoreCase(option, "px")) {
+                return;
+            }
+
+            const ttl_ms = std.fmt.parseInt(i64, option_value, 10) catch return;
+            expires_at_ms = std.time.milliTimestamp() + ttl_ms;
+        }
+
+        try database.set(key, value, expires_at_ms);
+        try stream.writeAll("+OK\r\n");
+    } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
+        if (command.arg_count < 1) return;
+        const key = command.args[0];
+        const value = database.get(key) orelse {
+            try stream.writeAll("$-1\r\n");
+            return;
+        };
+
+        try writeBulkString(stream, value);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
+        if (command.arg_count < 1) return;
+        const key = command.args[0];
+        const new_number = database.incr(key) catch |err| switch (err) {
+            error.InvalidInteger => {
+                try stream.writeAll("-ERR value is not an integer or out of range\r\n");
+                return;
+            },
+            else => return err,
+        };
+
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{new_number});
+        try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "type")) {
+        if (command.arg_count < 1) return;
+        const key = command.args[0];
+
+        if (database.isStream(key)) {
+            try stream.writeAll("+stream\r\n");
+        } else if (database.get(key) != null) {
+            try stream.writeAll("+string\r\n");
+        } else {
+            try stream.writeAll("+none\r\n");
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "xadd")) {
+        if (command.arg_count < 4) return;
+        if ((command.arg_count - 2) % 2 != 0) return;
+
+        const key = command.args[0];
+        const requested_id = command.args[1];
+        var generated_id_buffer: [64]u8 = undefined;
+        const id = if (std.mem.eql(u8, requested_id, "*")) blk: {
+            const milliseconds_time: u64 = @intCast(std.time.milliTimestamp());
+            var sequence_number: u64 = 0;
+            if (database.getLastStreamSequenceNumber(key, milliseconds_time)) |last_sequence_number| {
+                sequence_number = last_sequence_number + 1;
+            }
+
+            const generated_id = try std.fmt.bufPrint(&generated_id_buffer, "{d}-{d}", .{ milliseconds_time, sequence_number });
+            break :blk generated_id;
+        } else if (parseAutoSequenceMillisecondsTime(requested_id)) |milliseconds_time| blk: {
+            var sequence_number: u64 = 0;
+            if (database.getLastStreamSequenceNumber(key, milliseconds_time)) |last_sequence_number| {
+                sequence_number = last_sequence_number + 1;
+            } else if (milliseconds_time == 0) {
+                sequence_number = 1;
+            }
+
+            const generated_id = try std.fmt.bufPrint(&generated_id_buffer, "{d}-{d}", .{ milliseconds_time, sequence_number });
+            break :blk generated_id;
+        } else requested_id;
+
+        const stream_id = parseStreamId(id) orelse return;
+
+        if (stream_id.milliseconds_time == 0 and stream_id.sequence_number == 0) {
+            try stream.writeAll("-ERR The ID specified in XADD must be greater than 0-0\r\n");
+            return;
+        }
+
+        if (database.getLastStreamId(key)) |last_stream_id| {
+            if (compareStreamIds(stream_id, last_stream_id) <= 0) {
+                try stream.writeAll("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n");
+                return;
+            }
+        }
+
+        try database.xadd(key, id, command.args[2..command.arg_count]);
+        try writeBulkString(stream, id);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "xrange")) {
+        if (command.arg_count < 3) return;
+        const key = command.args[0];
+        const start_id = parseXRangeId(command.args[1], true) orelse return;
+        const end_id = parseXRangeId(command.args[2], false) orelse return;
+
+        try database.writeXRange(stream, key, start_id, end_id);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "xread")) {
+        if (command.arg_count < 3) return;
+        var block_timeout_ms: ?i64 = null;
+        var streams_index: usize = 0;
+
+        if (std.ascii.eqlIgnoreCase(command.args[0], "block")) {
+            if (command.arg_count < 5) return;
+
+            const parsed_timeout_ms = std.fmt.parseInt(i64, command.args[1], 10) catch return;
+            if (parsed_timeout_ms < 0) return;
+
+            block_timeout_ms = parsed_timeout_ms;
+            streams_index = 2;
+        }
+
+        if (!std.ascii.eqlIgnoreCase(command.args[streams_index], "streams")) return;
+        if ((command.arg_count - streams_index - 1) % 2 != 0) return;
+
+        const stream_count = (command.arg_count - streams_index - 1) / 2;
+        const keys = command.args[streams_index + 1 .. streams_index + 1 + stream_count];
+        var start_ids: [max_command_args]StreamId = undefined;
+        var stream_index: usize = 0;
+
+        while (stream_index < stream_count) : (stream_index += 1) {
+            const raw_start_id = command.args[streams_index + 1 + stream_count + stream_index];
+
+            if (std.mem.eql(u8, raw_start_id, "$")) {
+                start_ids[stream_index] = database.getLastStreamId(keys[stream_index]) orelse .{
+                    .milliseconds_time = 0,
+                    .sequence_number = 0,
+                };
+            } else {
+                start_ids[stream_index] = parseStreamId(raw_start_id) orelse return;
+            }
+        }
+
+        if (block_timeout_ms) |timeout_ms| {
+            if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                if (timeout_ms == 0) {
+                    while (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                        std.Thread.sleep(std.time.ns_per_ms);
+                    }
+                } else {
+                    const deadline = std.time.milliTimestamp() + timeout_ms;
+
+                    while (std.time.milliTimestamp() < deadline) {
+                        if (database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                            break;
+                        }
+
+                        std.Thread.sleep(std.time.ns_per_ms);
+                    }
+
+                    if (!database.hasXReadEntries(keys, start_ids[0..stream_count])) {
+                        try stream.writeAll("*-1\r\n");
+                        return;
+                    }
+                }
+            }
+        }
+
+        try database.writeXRead(stream, keys, start_ids[0..stream_count]);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "rpush")) {
+        if (command.arg_count < 2) return;
+        const key = command.args[0];
+
+        const list_len = try database.rpush(key, command.args[1..command.arg_count]);
+
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+        try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "lpush")) {
+        if (command.arg_count < 2) return;
+        const key = command.args[0];
+
+        const list_len = try database.lpush(key, command.args[1..command.arg_count]);
+
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+        try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "lrange")) {
+        if (command.arg_count < 3) return;
+        const key = command.args[0];
+        const start = std.fmt.parseInt(i64, command.args[1], 10) catch return;
+        const stop = std.fmt.parseInt(i64, command.args[2], 10) catch return;
+
+        try database.writeLRange(stream, key, start, stop);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "llen")) {
+        if (command.arg_count < 1) return;
+        const key = command.args[0];
+        const list_len = database.llen(key);
+
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{list_len});
+        try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "lpop")) {
+        if (command.arg_count < 1) return;
+        const key = command.args[0];
+
+        if (command.arg_count > 1) {
+            const count = std.fmt.parseInt(usize, command.args[1], 10) catch return;
+            var values: std.ArrayList([]u8) = .empty;
+            defer {
+                for (values.items) |value| {
+                    database.allocator.free(value);
+                }
+                values.deinit(database.allocator);
+            }
+
+            var index: usize = 0;
+            while (index < count) : (index += 1) {
+                const value = database.lpop(key) orelse break;
+                try values.append(database.allocator, value);
+            }
+
+            var header_buffer: [32]u8 = undefined;
+            const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{values.items.len});
+            try stream.writeAll(header);
+
+            for (values.items) |value| {
+                try writeBulkString(stream, value);
+            }
+        } else {
+            const value = database.lpop(key) orelse {
+                try stream.writeAll("$-1\r\n");
+                return;
+            };
+
+            defer database.allocator.free(value);
+            try writeBulkString(stream, value);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "blpop")) {
+        if (command.arg_count < 2) return;
+        const key = command.args[0];
+        const timeout_seconds = std.fmt.parseFloat(f64, command.args[1]) catch return;
+        if (timeout_seconds < 0) return;
+
+        if (timeout_seconds > 0) {
+            const timeout_ms: i64 = @intFromFloat(timeout_seconds * 1000.0);
+            const deadline = std.time.milliTimestamp() + timeout_ms;
+            var got_value = false;
+
+            while (std.time.milliTimestamp() < deadline) {
+                if (database.lpop(key)) |value| {
+                    defer database.allocator.free(value);
+                    try writeBlpopResponse(stream, key, value);
+                    got_value = true;
+                    break;
+                }
+
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+
+            if (!got_value) {
+                if (database.lpop(key)) |value| {
+                    defer database.allocator.free(value);
+                    try writeBlpopResponse(stream, key, value);
+                } else {
+                    try stream.writeAll("*-1\r\n");
+                }
+            }
+            return;
+        }
+
+        var waiter = BlpopWaiter{
+            .key = try database.allocator.dupe(u8, key),
+        };
+        defer database.allocator.free(waiter.key);
+
+        waiter.mutex.lock();
+        defer waiter.mutex.unlock();
+
+        if (try database.beginBlpop(key, &waiter)) |value| {
+            defer database.allocator.free(value);
+            try writeBlpopResponse(stream, key, value);
+            return;
+        }
+
+        while (!waiter.ready) {
+            waiter.condition.wait(&waiter.mutex);
+        }
+
+        const value = waiter.value orelse return;
+        defer database.allocator.free(value);
+        try writeBlpopResponse(stream, waiter.key, value);
+    }
 }
 
 fn parseCommand(data: []const u8) ?RespCommand {
