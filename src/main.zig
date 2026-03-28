@@ -10,6 +10,11 @@ const ServerRole = enum {
     slave,
 };
 
+const ReplicaOf = struct {
+    host: []const u8,
+    port: u16,
+};
+
 const RespCommand = struct {
     name: []const u8,
     args: [max_command_args][]const u8,
@@ -608,6 +613,7 @@ pub fn main() !void {
 
     var port: u16 = 6379;
     var role: ServerRole = .master;
+    var replicaof: ?ReplicaOf = null;
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         if (std.mem.eql(u8, args[arg_index], "--port")) {
@@ -623,7 +629,22 @@ pub fn main() !void {
                 return error.MissingReplicaOfValue;
             }
 
+            var parts = std.mem.tokenizeScalar(u8, args[arg_index], ' ');
+            const host = parts.next() orelse return error.InvalidReplicaOfValue;
+            const port_text = parts.next() orelse blk: {
+                arg_index += 1;
+                if (arg_index >= args.len) {
+                    return error.MissingReplicaOfPort;
+                }
+
+                break :blk args[arg_index];
+            };
+
             role = .slave;
+            replicaof = .{
+                .host = host,
+                .port = try std.fmt.parseInt(u16, port_text, 10),
+            };
         }
     }
 
@@ -634,6 +655,11 @@ pub fn main() !void {
         .reuse_address = true,
     });
     defer listener.deinit();
+
+    if (replicaof) |master| {
+        const replication_thread = try std.Thread.spawn(.{}, sendPingToMaster, .{ allocator, master });
+        replication_thread.detach();
+    }
 
     while (true) {
         const connection = try listener.accept();
@@ -705,6 +731,19 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
         queued_command.deinit(allocator);
     }
     queued_commands.clearRetainingCapacity();
+}
+
+fn sendPingToMaster(allocator: std.mem.Allocator, master: ReplicaOf) !void {
+    while (true) {
+        var stream = net.tcpConnectToHost(allocator, master.host, master.port) catch {
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+            continue;
+        };
+        defer stream.close();
+
+        try stream.writeAll("*1\r\n$4\r\nPING\r\n");
+        return;
+    }
 }
 
 fn executeCommand(stream: anytype, database: *Database, role: ServerRole, command: RespCommand) !void {
