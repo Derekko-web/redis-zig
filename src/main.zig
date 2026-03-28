@@ -657,7 +657,7 @@ pub fn main() !void {
     defer listener.deinit();
 
     if (replicaof) |master| {
-        const replication_thread = try std.Thread.spawn(.{}, sendPingToMaster, .{ allocator, master });
+        const replication_thread = try std.Thread.spawn(.{}, performReplicationHandshake, .{ allocator, master, port });
         replication_thread.detach();
     }
 
@@ -733,7 +733,7 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
     queued_commands.clearRetainingCapacity();
 }
 
-fn sendPingToMaster(allocator: std.mem.Allocator, master: ReplicaOf) !void {
+fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16) !void {
     while (true) {
         var stream = net.tcpConnectToHost(allocator, master.host, master.port) catch {
             std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -741,8 +741,58 @@ fn sendPingToMaster(allocator: std.mem.Allocator, master: ReplicaOf) !void {
         };
         defer stream.close();
 
-        try stream.writeAll("*1\r\n$4\r\nPING\r\n");
+        try writeRespArrayCommand(stream, &.{"PING"});
+        try expectSimpleString(stream, "PONG");
+
+        var port_buffer: [5]u8 = undefined;
+        const port_text = try std.fmt.bufPrint(&port_buffer, "{d}", .{listening_port});
+        try writeRespArrayCommand(stream, &.{ "REPLCONF", "listening-port", port_text });
+        try expectSimpleString(stream, "OK");
+
+        try writeRespArrayCommand(stream, &.{ "REPLCONF", "capa", "psync2" });
+        try expectSimpleString(stream, "OK");
         return;
+    }
+}
+
+fn writeRespArrayCommand(stream: anytype, args: []const []const u8) !void {
+    var header_buffer: [32]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{args.len});
+    try stream.writeAll(header);
+
+    for (args) |arg| {
+        try writeBulkString(stream, arg);
+    }
+}
+
+fn expectSimpleString(stream: anytype, expected: []const u8) !void {
+    var line_buffer: [64]u8 = undefined;
+    var line_len: usize = 0;
+
+    while (true) {
+        if (line_len == line_buffer.len) {
+            return error.ReplicationResponseTooLong;
+        }
+
+        const bytes_read = try stream.read(line_buffer[line_len .. line_len + 1]);
+        if (bytes_read == 0) {
+            return error.UnexpectedEof;
+        }
+
+        line_len += bytes_read;
+        if (line_len >= 2 and
+            line_buffer[line_len - 2] == '\r' and
+            line_buffer[line_len - 1] == '\n')
+        {
+            break;
+        }
+    }
+
+    var expected_buffer: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_buffer, "+{s}", .{expected});
+    const line = line_buffer[0 .. line_len - 2];
+    if (!std.mem.eql(u8, line, expected_line)) {
+        return error.UnexpectedReplicationResponse;
     }
 }
 
