@@ -751,6 +751,8 @@ fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, 
 
         try writeRespArrayCommand(stream, &.{ "REPLCONF", "capa", "psync2" });
         try expectSimpleString(stream, "OK");
+
+        try writeRespArrayCommand(stream, &.{ "PSYNC", "?", "-1" });
         return;
     }
 }
