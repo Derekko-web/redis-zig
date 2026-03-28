@@ -605,6 +605,11 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
 
     var buffer: [1024]u8 = undefined;
     var in_transaction = false;
+    var queued_commands: std.ArrayList(QueuedCommand) = .empty;
+    defer {
+        clearQueuedCommands(database.allocator, &queued_commands);
+        queued_commands.deinit(database.allocator);
+    }
     while (true) {
         const bytes_read = connection.stream.read(&buffer) catch 0;
         if (bytes_read == 0) {
@@ -612,6 +617,12 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
         }
 
         const command = parseCommand(buffer[0..bytes_read]) orelse continue;
+
+        if (in_transaction and !std.ascii.eqlIgnoreCase(command.name, "exec")) {
+            try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
+            try connection.stream.writeAll("+QUEUED\r\n");
+            continue;
+        }
 
         if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
             try connection.stream.writeAll("+PONG\r\n");
@@ -625,6 +636,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             }
 
             in_transaction = false;
+            clearQueuedCommands(database.allocator, &queued_commands);
             try connection.stream.writeAll("*0\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
             if (command.arg_count < 1) continue;
@@ -930,6 +942,13 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             try writeBlpopResponse(connection.stream, waiter.key, value);
         }
     }
+}
+
+fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.ArrayList(QueuedCommand)) void {
+    for (queued_commands.items) |*queued_command| {
+        queued_command.deinit(allocator);
+    }
+    queued_commands.clearRetainingCapacity();
 }
 
 fn parseCommand(data: []const u8) ?RespCommand {
