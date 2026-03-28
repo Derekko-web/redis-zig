@@ -3,6 +3,11 @@ const stdout = std.fs.File.stdout();
 const net = std.net;
 const max_command_args = 64;
 
+const ServerRole = enum {
+    master,
+    slave,
+};
+
 const RespCommand = struct {
     name: []const u8,
     args: [max_command_args][]const u8,
@@ -600,18 +605,24 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     var port: u16 = 6379;
+    var role: ServerRole = .master;
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
-        if (!std.mem.eql(u8, args[arg_index], "--port")) {
-            continue;
-        }
+        if (std.mem.eql(u8, args[arg_index], "--port")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                return error.MissingPortValue;
+            }
 
-        arg_index += 1;
-        if (arg_index >= args.len) {
-            return error.MissingPortValue;
-        }
+            port = try std.fmt.parseInt(u16, args[arg_index], 10);
+        } else if (std.mem.eql(u8, args[arg_index], "--replicaof")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                return error.MissingReplicaOfValue;
+            }
 
-        port = try std.fmt.parseInt(u16, args[arg_index], 10);
+            role = .slave;
+        }
     }
 
     const address = try net.Address.resolveIp("127.0.0.1", port);
@@ -627,12 +638,12 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, role });
         thread.detach();
     }
 }
 
-fn handleConnection(connection: std.net.Server.Connection, database: *Database) !void {
+fn handleConnection(connection: std.net.Server.Connection, database: *Database, role: ServerRole) !void {
     defer connection.stream.close();
 
     var buffer: [1024]u8 = undefined;
@@ -665,7 +676,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             try connection.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(connection.stream, database, queued_command.toRespCommand());
+                try executeCommand(connection.stream, database, role, queued_command.toRespCommand());
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -682,7 +693,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try connection.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(connection.stream, database, command);
+            try executeCommand(connection.stream, database, role, command);
         }
     }
 }
@@ -694,12 +705,15 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
     queued_commands.clearRetainingCapacity();
 }
 
-fn executeCommand(stream: anytype, database: *Database, command: RespCommand) !void {
+fn executeCommand(stream: anytype, database: *Database, role: ServerRole, command: RespCommand) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         try stream.writeAll("+PONG\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
-            try writeBulkString(stream, "role:master");
+            try writeBulkString(stream, switch (role) {
+                .master => "role:master",
+                .slave => "role:slave",
+            });
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
