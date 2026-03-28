@@ -650,6 +650,15 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database) 
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
+        } else if (std.ascii.eqlIgnoreCase(command.name, "discard")) {
+            if (!in_transaction) {
+                try connection.stream.writeAll("-ERR DISCARD without MULTI\r\n");
+                continue;
+            }
+
+            in_transaction = false;
+            clearQueuedCommands(database.allocator, &queued_commands);
+            try connection.stream.writeAll("+OK\r\n");
         } else if (in_transaction) {
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try connection.stream.writeAll("+QUEUED\r\n");
