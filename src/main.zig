@@ -697,6 +697,10 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
 fn executeCommand(stream: anytype, database: *Database, command: RespCommand) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         try stream.writeAll("+PONG\r\n");
+    } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
+        if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
+            try writeBulkString(stream, "role:master");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
         const message = command.args[0];
