@@ -699,6 +699,40 @@ const Database = struct {
         return null;
     }
 
+    fn writeGeoSearch(self: *Database, stream: anytype, key: []const u8, longitude: f64, latitude: f64, radius_meters: f64) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var match_count: usize = 0;
+        for (self.zsets.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const position = geoPositionFromScore(@intFromFloat(entry.score));
+            const distance = geoDistanceMeters(longitude, latitude, position.longitude, position.latitude);
+            if (distance <= radius_meters) {
+                match_count += 1;
+            }
+        }
+
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{match_count});
+        try stream.writeAll(header);
+
+        for (self.zsets.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            const position = geoPositionFromScore(@intFromFloat(entry.score));
+            const distance = geoDistanceMeters(longitude, latitude, position.longitude, position.latitude);
+            if (distance <= radius_meters) {
+                try writeBulkString(stream, entry.member);
+            }
+        }
+    }
+
     fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1960,6 +1994,29 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             var distance_buffer: [64]u8 = undefined;
             const distance_text = try std.fmt.bufPrint(&distance_buffer, "{d:.4}", .{distance});
             try writeBulkString(stream, distance_text);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "geosearch")) {
+        if (command.arg_count < 7) return;
+        if (!std.ascii.eqlIgnoreCase(command.args[1], "fromlonlat")) return;
+        if (!std.ascii.eqlIgnoreCase(command.args[4], "byradius")) return;
+
+        const longitude = std.fmt.parseFloat(f64, command.args[2]) catch return;
+        const latitude = std.fmt.parseFloat(f64, command.args[3]) catch return;
+        const radius = std.fmt.parseFloat(f64, command.args[5]) catch return;
+
+        const radius_meters = if (std.ascii.eqlIgnoreCase(command.args[6], "m"))
+            radius
+        else if (std.ascii.eqlIgnoreCase(command.args[6], "km"))
+            radius * 1000.0
+        else if (std.ascii.eqlIgnoreCase(command.args[6], "mi"))
+            radius * 1609.34
+        else if (std.ascii.eqlIgnoreCase(command.args[6], "ft"))
+            radius * 0.3048
+        else
+            return;
+
+        if (should_reply) {
+            try database.writeGeoSearch(stream, command.args[0], longitude, latitude, radius_meters);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
