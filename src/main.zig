@@ -212,6 +212,31 @@ const AclState = struct {
         self.nopass = false;
     }
 
+    fn authenticate(self: *AclState, username: []const u8, password: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!std.mem.eql(u8, username, "default")) {
+            return false;
+        }
+
+        if (self.nopass) {
+            return true;
+        }
+
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(password, &digest, .{});
+        const password_hash = std.fmt.bytesToHex(digest, .lower);
+
+        for (self.passwords.items) |existing_hash| {
+            if (std.mem.eql(u8, existing_hash[0..], password_hash[0..])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     fn writeGetUserDefault(self: *AclState, stream: anytype) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1819,6 +1844,15 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             if (should_reply) {
                 try stream.writeAll("+OK\r\n");
             }
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "auth")) {
+        if (command.arg_count < 2) return;
+        if (!should_reply) return;
+
+        if (acl.authenticate(command.args[0], command.args[1])) {
+            try stream.writeAll("+OK\r\n");
+        } else {
+            try stream.writeAll("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
