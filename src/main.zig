@@ -16,6 +16,60 @@ const ReplicaOf = struct {
     port: u16,
 };
 
+const ReplicaRegistry = struct {
+    allocator: std.mem.Allocator,
+    streams: std.ArrayList(*net.Stream),
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator) ReplicaRegistry {
+        return .{
+            .allocator = allocator,
+            .streams = .empty,
+        };
+    }
+
+    fn register(self: *ReplicaRegistry, stream: *net.Stream) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.streams.items) |registered_stream| {
+            if (registered_stream == stream) {
+                return;
+            }
+        }
+
+        try self.streams.append(self.allocator, stream);
+    }
+
+    fn unregister(self: *ReplicaRegistry, stream: *net.Stream) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.streams.items, 0..) |registered_stream, index| {
+            if (registered_stream == stream) {
+                _ = self.streams.orderedRemove(index);
+                return;
+            }
+        }
+    }
+
+    fn propagate(self: *ReplicaRegistry, command: RespCommand) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var index: usize = 0;
+        while (index < self.streams.items.len) {
+            const stream = self.streams.items[index];
+            writeRespCommand(stream, command) catch {
+                _ = self.streams.orderedRemove(index);
+                continue;
+            };
+
+            index += 1;
+        }
+    }
+};
+
 const RespCommand = struct {
     name: []const u8,
     args: [max_command_args][]const u8,
@@ -651,6 +705,7 @@ pub fn main() !void {
 
     const address = try net.Address.resolveIp("127.0.0.1", port);
     var database = Database.init(allocator);
+    var replicas = ReplicaRegistry.init(allocator);
 
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -667,13 +722,17 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, role });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, role });
         thread.detach();
     }
 }
 
-fn handleConnection(connection: std.net.Server.Connection, database: *Database, role: ServerRole) !void {
-    defer connection.stream.close();
+fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, role: ServerRole) !void {
+    var client = connection;
+    defer {
+        replicas.unregister(&client.stream);
+        client.stream.close();
+    }
 
     var buffer: [1024]u8 = undefined;
     var in_transaction = false;
@@ -683,7 +742,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
         queued_commands.deinit(database.allocator);
     }
     while (true) {
-        const bytes_read = connection.stream.read(&buffer) catch 0;
+        const bytes_read = client.stream.read(&buffer) catch 0;
         if (bytes_read == 0) {
             break;
         }
@@ -692,37 +751,37 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
 
         if (std.ascii.eqlIgnoreCase(command.name, "multi")) {
             in_transaction = true;
-            try connection.stream.writeAll("+OK\r\n");
+            try client.stream.writeAll("+OK\r\n");
         } else if (std.ascii.eqlIgnoreCase(command.name, "exec")) {
             if (!in_transaction) {
-                try connection.stream.writeAll("-ERR EXEC without MULTI\r\n");
+                try client.stream.writeAll("-ERR EXEC without MULTI\r\n");
                 continue;
             }
 
             in_transaction = false;
             var header_buffer: [32]u8 = undefined;
             const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{queued_commands.items.len});
-            try connection.stream.writeAll(header);
+            try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(connection.stream, database, role, queued_command.toRespCommand());
+                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand());
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
         } else if (std.ascii.eqlIgnoreCase(command.name, "discard")) {
             if (!in_transaction) {
-                try connection.stream.writeAll("-ERR DISCARD without MULTI\r\n");
+                try client.stream.writeAll("-ERR DISCARD without MULTI\r\n");
                 continue;
             }
 
             in_transaction = false;
             clearQueuedCommands(database.allocator, &queued_commands);
-            try connection.stream.writeAll("+OK\r\n");
+            try client.stream.writeAll("+OK\r\n");
         } else if (in_transaction) {
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
-            try connection.stream.writeAll("+QUEUED\r\n");
+            try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(connection.stream, database, role, command);
+            try executeCommand(&client.stream, database, replicas, role, command);
         }
     }
 }
@@ -768,6 +827,18 @@ fn writeRespArrayCommand(stream: anytype, args: []const []const u8) !void {
     }
 }
 
+fn writeRespCommand(stream: anytype, command: RespCommand) !void {
+    var header_buffer: [32]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{command.arg_count + 1});
+    try stream.writeAll(header);
+    try writeBulkString(stream, command.name);
+
+    var arg_index: usize = 0;
+    while (arg_index < command.arg_count) : (arg_index += 1) {
+        try writeBulkString(stream, command.args[arg_index]);
+    }
+}
+
 fn expectSimpleString(stream: anytype, expected: []const u8) !void {
     var line_buffer: [64]u8 = undefined;
     var line_len: usize = 0;
@@ -799,7 +870,7 @@ fn expectSimpleString(stream: anytype, expected: []const u8) !void {
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, role: ServerRole, command: RespCommand) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         try stream.writeAll("+PONG\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
@@ -812,6 +883,7 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
         });
         try stream.writeAll(fullresync);
         try writeEmptyRdb(stream);
+        try replicas.register(stream);
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
             try writeInfoReplication(stream, role);
@@ -841,6 +913,9 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
 
         try database.set(key, value, expires_at_ms);
         try stream.writeAll("+OK\r\n");
+        if (role == .master) {
+            try replicas.propagate(command);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
         if (command.arg_count < 1) return;
         const key = command.args[0];
