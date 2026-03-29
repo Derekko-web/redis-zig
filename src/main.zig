@@ -211,6 +211,17 @@ const ClientSubscriptions = struct {
         try self.channels.append(self.allocator, try self.allocator.dupe(u8, channel));
         return self.channels.items.len;
     }
+
+    fn count(self: *const ClientSubscriptions) usize {
+        return self.channels.items.len;
+    }
+
+    fn clear(self: *ClientSubscriptions) void {
+        for (self.channels.items) |channel| {
+            self.allocator.free(channel);
+        }
+        self.channels.clearRetainingCapacity();
+    }
 };
 
 const QueuedCommand = struct {
@@ -938,10 +949,19 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
         }
 
         const command = parseCommand(buffer[0..bytes_read]) orelse continue;
+        if (subscriptions.count() > 0 and !isSubscribedModeCommandAllowed(command.name)) {
+            var error_buffer: [256]u8 = undefined;
+            const error_message = try std.fmt.bufPrint(&error_buffer, "-ERR Can't execute '{s}' in subscribed mode\r\n", .{command.name});
+            try client.stream.writeAll(error_message);
+            continue;
+        }
 
         if (std.ascii.eqlIgnoreCase(command.name, "multi")) {
             in_transaction = true;
             try client.stream.writeAll("+OK\r\n");
+        } else if (std.ascii.eqlIgnoreCase(command.name, "quit")) {
+            try client.stream.writeAll("+OK\r\n");
+            break;
         } else if (std.ascii.eqlIgnoreCase(command.name, "exec")) {
             if (!in_transaction) {
                 try client.stream.writeAll("-ERR EXEC without MULTI\r\n");
@@ -981,6 +1001,16 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
         queued_command.deinit(allocator);
     }
     queued_commands.clearRetainingCapacity();
+}
+
+fn isSubscribedModeCommandAllowed(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "subscribe") or
+        std.ascii.eqlIgnoreCase(command_name, "unsubscribe") or
+        std.ascii.eqlIgnoreCase(command_name, "psubscribe") or
+        std.ascii.eqlIgnoreCase(command_name, "punsubscribe") or
+        std.ascii.eqlIgnoreCase(command_name, "ping") or
+        std.ascii.eqlIgnoreCase(command_name, "quit") or
+        std.ascii.eqlIgnoreCase(command_name, "reset");
 }
 
 fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16, database: *Database, replicas: *ReplicaRegistry) !void {
@@ -1209,6 +1239,11 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         var integer_buffer: [32]u8 = undefined;
         const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
         try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "reset")) {
+        subscriptions.clear();
+        if (should_reply) {
+            try stream.writeAll("+RESET\r\n");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
         const key = command.args[0];
