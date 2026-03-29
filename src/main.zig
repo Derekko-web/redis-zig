@@ -429,6 +429,12 @@ const StreamEntry = struct {
     fields: std.ArrayList(StreamField),
 };
 
+const ZSetEntry = struct {
+    key: []u8,
+    member: []u8,
+    score: f64,
+};
+
 const StreamId = struct {
     milliseconds_time: u64,
     sequence_number: u64,
@@ -447,6 +453,7 @@ const Database = struct {
     entries: std.ArrayList(Entry),
     lists: std.ArrayList(ListEntry),
     streams: std.ArrayList(StreamEntry),
+    zsets: std.ArrayList(ZSetEntry),
     waiters: std.ArrayList(*BlpopWaiter),
     mutex: std.Thread.Mutex = .{},
 
@@ -456,6 +463,7 @@ const Database = struct {
             .entries = .empty,
             .lists = .empty,
             .streams = .empty,
+            .zsets = .empty,
             .waiters = .empty,
         };
     }
@@ -563,6 +571,28 @@ const Database = struct {
         return 1;
     }
 
+    fn zadd(self: *Database, key: []const u8, score: f64, member: []const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.zsets.items) |*entry| {
+            if (!std.mem.eql(u8, entry.key, key) or !std.mem.eql(u8, entry.member, member)) {
+                continue;
+            }
+
+            entry.score = score;
+            return 0;
+        }
+
+        try self.zsets.append(self.allocator, .{
+            .key = try self.allocator.dupe(u8, key),
+            .member = try self.allocator.dupe(u8, member),
+            .score = score,
+        });
+
+        return 1;
+    }
+
     fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -589,6 +619,19 @@ const Database = struct {
         defer self.mutex.unlock();
 
         for (self.streams.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn isZSet(self: *Database, key: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.zsets.items) |entry| {
             if (std.mem.eql(u8, entry.key, key)) {
                 return true;
             }
@@ -1445,6 +1488,25 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (role == .master) {
             try replicas.propagate(command);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zadd")) {
+        if (command.arg_count < 3 or (command.arg_count - 1) % 2 != 0) return;
+
+        const key = command.args[0];
+        var added_members: usize = 0;
+        var arg_index: usize = 1;
+        while (arg_index < command.arg_count) : (arg_index += 2) {
+            const score = std.fmt.parseFloat(f64, command.args[arg_index]) catch return;
+            added_members += try database.zadd(key, score, command.args[arg_index + 1]);
+        }
+
+        if (should_reply) {
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{added_members});
+            try stream.writeAll(integer);
+        }
+        if (role == .master) {
+            try replicas.propagate(command);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
         const requested_replicas = std.fmt.parseInt(usize, command.args[0], 10) catch return;
@@ -1507,6 +1569,10 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (database.isStream(key)) {
             if (should_reply) {
                 try stream.writeAll("+stream\r\n");
+            }
+        } else if (database.isZSet(key)) {
+            if (should_reply) {
+                try stream.writeAll("+zset\r\n");
             }
         } else if (database.get(key) != null) {
             if (should_reply) {
