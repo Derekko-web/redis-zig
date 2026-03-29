@@ -435,6 +435,11 @@ const ZSetEntry = struct {
     score: f64,
 };
 
+const ZSetMemberView = struct {
+    member: []const u8,
+    score: f64,
+};
+
 const StreamId = struct {
     milliseconds_time: u64,
     sequence_number: u64,
@@ -618,6 +623,72 @@ const Database = struct {
         }
 
         return rank;
+    }
+
+    fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: usize, stop: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var member_count: usize = 0;
+        for (self.zsets.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                member_count += 1;
+            }
+        }
+
+        if (member_count == 0 or start >= member_count) {
+            try stream.writeAll("*0\r\n");
+            return;
+        }
+
+        var members = try self.allocator.alloc(ZSetMemberView, member_count);
+        defer self.allocator.free(members);
+
+        var member_index: usize = 0;
+        for (self.zsets.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            members[member_index] = .{
+                .member = entry.member,
+                .score = entry.score,
+            };
+            member_index += 1;
+        }
+
+        var left: usize = 0;
+        while (left < members.len) : (left += 1) {
+            var best_index = left;
+            var right = left + 1;
+            while (right < members.len) : (right += 1) {
+                const best = members[best_index];
+                const candidate = members[right];
+                if (candidate.score < best.score or (candidate.score == best.score and std.mem.order(u8, candidate.member, best.member) == .lt)) {
+                    best_index = right;
+                }
+            }
+
+            if (best_index != left) {
+                std.mem.swap(ZSetMemberView, &members[left], &members[best_index]);
+            }
+        }
+
+        const bounded_stop = @min(stop, members.len - 1);
+        if (start > bounded_stop) {
+            try stream.writeAll("*0\r\n");
+            return;
+        }
+
+        const response_len = bounded_stop - start + 1;
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{response_len});
+        try stream.writeAll(header);
+
+        var response_index = start;
+        while (response_index <= bounded_stop) : (response_index += 1) {
+            try writeBulkString(stream, members[response_index].member);
+        }
     }
 
     fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
@@ -1548,6 +1619,14 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{rank});
             try stream.writeAll(integer);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zrange")) {
+        if (command.arg_count < 3) return;
+
+        const start = std.fmt.parseInt(usize, command.args[1], 10) catch return;
+        const stop = std.fmt.parseInt(usize, command.args[2], 10) catch return;
+        if (should_reply) {
+            try database.writeZRange(stream, command.args[0], start, stop);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
