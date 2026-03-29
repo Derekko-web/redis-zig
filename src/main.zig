@@ -183,6 +183,73 @@ const ParsedCommand = struct {
     bytes_consumed: usize,
 };
 
+const PubSubChannel = struct {
+    name: []u8,
+    subscriber_count: usize,
+};
+
+const PubSubRegistry = struct {
+    allocator: std.mem.Allocator,
+    channels: std.ArrayList(PubSubChannel),
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator) PubSubRegistry {
+        return .{
+            .allocator = allocator,
+            .channels = .empty,
+        };
+    }
+
+    fn subscribe(self: *PubSubRegistry, channel: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.channels.items) |*existing_channel| {
+            if (std.mem.eql(u8, existing_channel.name, channel)) {
+                existing_channel.subscriber_count += 1;
+                return;
+            }
+        }
+
+        try self.channels.append(self.allocator, .{
+            .name = try self.allocator.dupe(u8, channel),
+            .subscriber_count = 1,
+        });
+    }
+
+    fn unsubscribe(self: *PubSubRegistry, channel: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.channels.items, 0..) |*existing_channel, index| {
+            if (!std.mem.eql(u8, existing_channel.name, channel)) {
+                continue;
+            }
+
+            if (existing_channel.subscriber_count > 1) {
+                existing_channel.subscriber_count -= 1;
+            } else {
+                self.allocator.free(existing_channel.name);
+                _ = self.channels.orderedRemove(index);
+            }
+            return;
+        }
+    }
+
+    fn countSubscribers(self: *PubSubRegistry, channel: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.channels.items) |existing_channel| {
+            if (std.mem.eql(u8, existing_channel.name, channel)) {
+                return existing_channel.subscriber_count;
+            }
+        }
+
+        return 0;
+    }
+};
+
 const ClientSubscriptions = struct {
     allocator: std.mem.Allocator,
     channels: std.ArrayList([]u8),
@@ -194,21 +261,25 @@ const ClientSubscriptions = struct {
         };
     }
 
-    fn deinit(self: *ClientSubscriptions) void {
-        for (self.channels.items) |channel| {
-            self.allocator.free(channel);
-        }
+    fn deinit(self: *ClientSubscriptions, pubsub: *PubSubRegistry) void {
+        self.clear(pubsub);
         self.channels.deinit(self.allocator);
     }
 
-    fn subscribe(self: *ClientSubscriptions, channel: []const u8) !usize {
+    fn subscribe(self: *ClientSubscriptions, pubsub: *PubSubRegistry, channel: []const u8) !usize {
         for (self.channels.items) |existing_channel| {
             if (std.mem.eql(u8, existing_channel, channel)) {
                 return self.channels.items.len;
             }
         }
 
-        try self.channels.append(self.allocator, try self.allocator.dupe(u8, channel));
+        const owned_channel = try self.allocator.dupe(u8, channel);
+        errdefer self.allocator.free(owned_channel);
+
+        try self.channels.append(self.allocator, owned_channel);
+        errdefer _ = self.channels.pop();
+
+        try pubsub.subscribe(channel);
         return self.channels.items.len;
     }
 
@@ -216,8 +287,9 @@ const ClientSubscriptions = struct {
         return self.channels.items.len;
     }
 
-    fn clear(self: *ClientSubscriptions) void {
+    fn clear(self: *ClientSubscriptions, pubsub: *PubSubRegistry) void {
         for (self.channels.items) |channel| {
+            pubsub.unsubscribe(channel);
             self.allocator.free(channel);
         }
         self.channels.clearRetainingCapacity();
@@ -905,6 +977,7 @@ pub fn main() !void {
     var database = Database.init(allocator);
     try loadRdbFromConfig(allocator, &database, config);
     var replicas = ReplicaRegistry.init(allocator);
+    var pubsub = PubSubRegistry.init(allocator);
 
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -921,12 +994,12 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, &config, role });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, &pubsub, &config, role });
         thread.detach();
     }
 }
 
-fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, config: *const ServerConfig, role: ServerRole) !void {
+fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, config: *const ServerConfig, role: ServerRole) !void {
     var client = connection;
     defer {
         replicas.unregister(&client.stream);
@@ -940,7 +1013,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
     defer {
         clearQueuedCommands(database.allocator, &queued_commands);
         queued_commands.deinit(database.allocator);
-        subscriptions.deinit();
+        subscriptions.deinit(pubsub);
     }
     while (true) {
         const bytes_read = client.stream.read(&buffer) catch 0;
@@ -974,7 +1047,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
+                try executeCommand(&client.stream, database, replicas, pubsub, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -991,7 +1064,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, &subscriptions, config, role, command, true, 0);
+            try executeCommand(&client.stream, database, replicas, pubsub, &subscriptions, config, role, command, true, 0);
         }
     }
 }
@@ -1144,9 +1217,10 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     var pending: std.ArrayList(u8) = .empty;
     var replication_offset: u64 = 0;
     const config = ServerConfig{};
+    var pubsub = PubSubRegistry.init(database.allocator);
     var subscriptions = ClientSubscriptions.init(database.allocator);
     defer pending.deinit(database.allocator);
-    defer subscriptions.deinit();
+    defer subscriptions.deinit(&pubsub);
 
     while (true) {
         const bytes_read = stream.read(&read_buffer) catch 0;
@@ -1162,7 +1236,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
+            try executeCommand(stream, database, replicas, &pubsub, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
             replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
@@ -1172,7 +1246,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             if (subscriptions.count() > 0) {
@@ -1237,7 +1311,7 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "subscribe")) {
         if (command.arg_count < 1 or !should_reply) return;
-        const subscription_count = try subscriptions.subscribe(command.args[0]);
+        const subscription_count = try subscriptions.subscribe(pubsub, command.args[0]);
 
         try stream.writeAll("*3\r\n");
         try writeBulkString(stream, "subscribe");
@@ -1246,10 +1320,16 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
         try stream.writeAll(integer);
     } else if (std.ascii.eqlIgnoreCase(command.name, "reset")) {
-        subscriptions.clear();
+        subscriptions.clear(pubsub);
         if (should_reply) {
             try stream.writeAll("+RESET\r\n");
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "publish")) {
+        if (command.arg_count < 2 or !should_reply) return;
+
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{pubsub.countSubscribers(command.args[0])});
+        try stream.writeAll(integer);
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
         const key = command.args[0];
