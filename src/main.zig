@@ -1734,9 +1734,18 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "acl")) {
         if (command.arg_count < 1) return;
-        if (!std.ascii.eqlIgnoreCase(command.args[0], "whoami")) return;
-        if (should_reply) {
-            try writeBulkString(stream, "default");
+        if (std.ascii.eqlIgnoreCase(command.args[0], "whoami")) {
+            if (should_reply) {
+                try writeBulkString(stream, "default");
+            }
+        } else if (std.ascii.eqlIgnoreCase(command.args[0], "getuser")) {
+            if (command.arg_count < 2) return;
+            if (!std.mem.eql(u8, command.args[1], "default")) return;
+            if (should_reply) {
+                try stream.writeAll("*2\r\n");
+                try writeBulkString(stream, "flags");
+                try stream.writeAll("*0\r\n");
+            }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
