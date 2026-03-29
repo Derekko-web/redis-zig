@@ -178,6 +178,63 @@ const ReplicaRegistry = struct {
     }
 };
 
+const password_hash_len = std.crypto.hash.sha2.Sha256.digest_length * 2;
+
+const AclState = struct {
+    allocator: std.mem.Allocator,
+    nopass: bool = true,
+    passwords: std.ArrayList([password_hash_len]u8),
+    mutex: std.Thread.Mutex = .{},
+
+    fn init(allocator: std.mem.Allocator) AclState {
+        return .{
+            .allocator = allocator,
+            .passwords = .empty,
+        };
+    }
+
+    fn addPassword(self: *AclState, password: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(password, &digest, .{});
+        const password_hash = std.fmt.bytesToHex(digest, .lower);
+
+        for (self.passwords.items) |existing_hash| {
+            if (std.mem.eql(u8, existing_hash[0..], password_hash[0..])) {
+                self.nopass = false;
+                return;
+            }
+        }
+
+        try self.passwords.append(self.allocator, password_hash);
+        self.nopass = false;
+    }
+
+    fn writeGetUserDefault(self: *AclState, stream: anytype) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        try stream.writeAll("*4\r\n");
+        try writeBulkString(stream, "flags");
+        if (self.nopass) {
+            try stream.writeAll("*1\r\n");
+            try writeBulkString(stream, "nopass");
+        } else {
+            try stream.writeAll("*0\r\n");
+        }
+
+        try writeBulkString(stream, "passwords");
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{self.passwords.items.len});
+        try stream.writeAll(header);
+        for (self.passwords.items) |password_hash| {
+            try writeBulkString(stream, password_hash[0..]);
+        }
+    }
+};
+
 const RespCommand = struct {
     name: []const u8,
     args: [max_command_args][]const u8,
@@ -1314,6 +1371,7 @@ pub fn main() !void {
     try loadRdbFromConfig(allocator, &database, config);
     var replicas = ReplicaRegistry.init(allocator);
     var pubsub = PubSubRegistry.init(allocator);
+    var acl = AclState.init(allocator);
 
     var listener = try address.listen(.{
         .reuse_address = true,
@@ -1321,7 +1379,7 @@ pub fn main() !void {
     defer listener.deinit();
 
     if (replicaof) |master| {
-        const replication_thread = try std.Thread.spawn(.{}, performReplicationHandshake, .{ allocator, master, port, &database, &replicas });
+        const replication_thread = try std.Thread.spawn(.{}, performReplicationHandshake, .{ allocator, master, port, &database, &replicas, &acl });
         replication_thread.detach();
     }
 
@@ -1330,12 +1388,12 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, &pubsub, &config, role });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, &pubsub, &acl, &config, role });
         thread.detach();
     }
 }
 
-fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, config: *const ServerConfig, role: ServerRole) !void {
+fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, acl: *AclState, config: *const ServerConfig, role: ServerRole) !void {
     var client = connection;
     defer {
         replicas.unregister(&client.stream);
@@ -1383,7 +1441,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, pubsub, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
+                try executeCommand(&client.stream, database, replicas, pubsub, acl, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -1400,7 +1458,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, pubsub, &subscriptions, config, role, command, true, 0);
+            try executeCommand(&client.stream, database, replicas, pubsub, acl, &subscriptions, config, role, command, true, 0);
         }
     }
 }
@@ -1422,7 +1480,7 @@ fn isSubscribedModeCommandAllowed(command_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(command_name, "reset");
 }
 
-fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16, database: *Database, replicas: *ReplicaRegistry) !void {
+fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16, database: *Database, replicas: *ReplicaRegistry, acl: *AclState) !void {
     while (true) {
         var stream = net.tcpConnectToHost(allocator, master.host, master.port) catch {
             std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -1444,7 +1502,7 @@ fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, 
         try writeRespArrayCommand(stream, &.{ "PSYNC", "?", "-1" });
         try expectFullResync(stream);
         try skipRdbFile(stream);
-        try processReplicationStream(&stream, database, replicas);
+        try processReplicationStream(&stream, database, replicas, acl);
         return;
     }
 }
@@ -1641,7 +1699,7 @@ fn skipRdbFile(stream: anytype) !void {
     }
 }
 
-fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: *ReplicaRegistry) !void {
+fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: *ReplicaRegistry, acl: *AclState) !void {
     var read_buffer: [1024]u8 = undefined;
     var pending: std.ArrayList(u8) = .empty;
     var replication_offset: u64 = 0;
@@ -1665,7 +1723,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, &pubsub, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
+            try executeCommand(stream, database, replicas, &pubsub, acl, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
             replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
@@ -1675,7 +1733,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, acl: *AclState, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             if (subscriptions.count() > 0) {
@@ -1742,12 +1800,24 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             if (command.arg_count < 2) return;
             if (!std.mem.eql(u8, command.args[1], "default")) return;
             if (should_reply) {
-                try stream.writeAll("*4\r\n");
-                try writeBulkString(stream, "flags");
-                try stream.writeAll("*1\r\n");
-                try writeBulkString(stream, "nopass");
-                try writeBulkString(stream, "passwords");
-                try stream.writeAll("*0\r\n");
+                try acl.writeGetUserDefault(stream);
+            }
+        } else if (std.ascii.eqlIgnoreCase(command.args[0], "setuser")) {
+            if (command.arg_count < 2) return;
+            if (!std.mem.eql(u8, command.args[1], "default")) return;
+
+            var arg_index: usize = 2;
+            while (arg_index < command.arg_count) : (arg_index += 1) {
+                const rule = command.args[arg_index];
+                if (rule.len == 0 or rule[0] != '>') {
+                    continue;
+                }
+
+                try acl.addPassword(rule[1..]);
+            }
+
+            if (should_reply) {
+                try stream.writeAll("+OK\r\n");
             }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
