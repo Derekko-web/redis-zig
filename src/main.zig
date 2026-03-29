@@ -1744,7 +1744,8 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             if (should_reply) {
                 try stream.writeAll("*2\r\n");
                 try writeBulkString(stream, "flags");
-                try stream.writeAll("*0\r\n");
+                try stream.writeAll("*1\r\n");
+                try writeBulkString(stream, "nopass");
             }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
