@@ -16,15 +16,21 @@ const ReplicaOf = struct {
     port: u16,
 };
 
+const ReplicaState = struct {
+    stream: *net.Stream,
+    ack_offset: u64 = 0,
+};
+
 const ReplicaRegistry = struct {
     allocator: std.mem.Allocator,
-    streams: std.ArrayList(*net.Stream),
+    replicas: std.ArrayList(ReplicaState),
+    replication_offset: u64 = 0,
     mutex: std.Thread.Mutex = .{},
 
     fn init(allocator: std.mem.Allocator) ReplicaRegistry {
         return .{
             .allocator = allocator,
-            .streams = .empty,
+            .replicas = .empty,
         };
     }
 
@@ -32,22 +38,24 @@ const ReplicaRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.streams.items) |registered_stream| {
-            if (registered_stream == stream) {
+        for (self.replicas.items) |replica| {
+            if (replica.stream == stream) {
                 return;
             }
         }
 
-        try self.streams.append(self.allocator, stream);
+        try self.replicas.append(self.allocator, .{
+            .stream = stream,
+        });
     }
 
     fn unregister(self: *ReplicaRegistry, stream: *net.Stream) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.streams.items, 0..) |registered_stream, index| {
-            if (registered_stream == stream) {
-                _ = self.streams.orderedRemove(index);
+        for (self.replicas.items, 0..) |replica, index| {
+            if (replica.stream == stream) {
+                _ = self.replicas.orderedRemove(index);
                 return;
             }
         }
@@ -57,11 +65,13 @@ const ReplicaRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        self.replication_offset += respCommandLength(command);
+
         var index: usize = 0;
-        while (index < self.streams.items.len) {
-            const stream = self.streams.items[index];
+        while (index < self.replicas.items.len) {
+            const stream = self.replicas.items[index].stream;
             writeRespCommand(stream, command) catch {
-                _ = self.streams.orderedRemove(index);
+                _ = self.replicas.orderedRemove(index);
                 continue;
             };
 
@@ -73,7 +83,87 @@ const ReplicaRegistry = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        return self.streams.items.len;
+        return self.replicas.items.len;
+    }
+
+    fn updateAck(self: *ReplicaRegistry, stream: *net.Stream, ack_offset: u64) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.replicas.items) |*replica| {
+            if (replica.stream == stream) {
+                replica.ack_offset = ack_offset;
+                return;
+            }
+        }
+    }
+
+    fn replicationOffset(self: *ReplicaRegistry) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.replication_offset;
+    }
+
+    fn countAcked(self: *ReplicaRegistry, target_offset: u64) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.countAckedLocked(target_offset);
+    }
+
+    fn countAckedLocked(self: *ReplicaRegistry, target_offset: u64) usize {
+        var acknowledged_replicas: usize = 0;
+        for (self.replicas.items) |replica| {
+            if (replica.ack_offset >= target_offset) {
+                acknowledged_replicas += 1;
+            }
+        }
+
+        return acknowledged_replicas;
+    }
+
+    fn requestAcks(self: *ReplicaRegistry) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var index: usize = 0;
+        while (index < self.replicas.items.len) {
+            const stream = self.replicas.items[index].stream;
+            writeRespArrayCommand(stream, &.{ "REPLCONF", "GETACK", "*" }) catch {
+                _ = self.replicas.orderedRemove(index);
+                continue;
+            };
+
+            index += 1;
+        }
+    }
+
+    fn waitForAcks(self: *ReplicaRegistry, target_offset: u64, requested_replicas: usize, timeout_ms: u64) !usize {
+        try self.requestAcks();
+
+        if (timeout_ms == 0) {
+            while (true) {
+                const acknowledged_replicas = self.countAcked(target_offset);
+                if (acknowledged_replicas >= requested_replicas) {
+                    return acknowledged_replicas;
+                }
+
+                std.Thread.sleep(std.time.ns_per_ms);
+            }
+        }
+
+        const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (std.time.milliTimestamp() < deadline) {
+            const acknowledged_replicas = self.countAcked(target_offset);
+            if (acknowledged_replicas >= requested_replicas) {
+                return acknowledged_replicas;
+            }
+
+            std.Thread.sleep(std.time.ns_per_ms);
+        }
+
+        return self.countAcked(target_offset);
     }
 };
 
@@ -854,6 +944,22 @@ fn writeRespCommand(stream: anytype, command: RespCommand) !void {
     }
 }
 
+fn respCommandLength(command: RespCommand) u64 {
+    var total_len: u64 = std.fmt.count("*{d}\r\n", .{command.arg_count + 1});
+    total_len += respBulkStringLength(command.name);
+
+    var arg_index: usize = 0;
+    while (arg_index < command.arg_count) : (arg_index += 1) {
+        total_len += respBulkStringLength(command.args[arg_index]);
+    }
+
+    return total_len;
+}
+
+fn respBulkStringLength(value: []const u8) u64 {
+    return std.fmt.count("${d}\r\n", .{value.len}) + value.len + 2;
+}
+
 fn readLine(stream: anytype, buffer: []u8) ![]const u8 {
     var line_len: usize = 0;
 
@@ -958,6 +1064,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             var offset_buffer: [32]u8 = undefined;
             const offset_text = try std.fmt.bufPrint(&offset_buffer, "{d}", .{replication_offset});
             try writeRespArrayCommand(stream, &.{ "REPLCONF", "ACK", offset_text });
+        } else if (role == .master and command.arg_count >= 2 and std.ascii.eqlIgnoreCase(command.args[0], "ack")) {
+            const ack_offset = std.fmt.parseInt(u64, command.args[1], 10) catch return;
+            replicas.updateAck(stream, ack_offset);
         } else if (should_reply) {
             try stream.writeAll("+OK\r\n");
         }
@@ -1010,12 +1119,19 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
-        _ = std.fmt.parseInt(usize, command.args[0], 10) catch return;
-        _ = std.fmt.parseInt(u64, command.args[1], 10) catch return;
+        const requested_replicas = std.fmt.parseInt(usize, command.args[0], 10) catch return;
+        const timeout_ms = std.fmt.parseInt(u64, command.args[1], 10) catch return;
 
         if (should_reply) {
+            const target_offset = replicas.replicationOffset();
+            var acknowledged_replicas = replicas.countAcked(target_offset);
+
+            if (target_offset > 0 and acknowledged_replicas < requested_replicas) {
+                acknowledged_replicas = try replicas.waitForAcks(target_offset, requested_replicas, timeout_ms);
+            }
+
             var integer_buffer: [32]u8 = undefined;
-            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{replicas.count()});
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{acknowledged_replicas});
             try stream.writeAll(integer);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
