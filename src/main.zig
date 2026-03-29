@@ -183,6 +183,36 @@ const ParsedCommand = struct {
     bytes_consumed: usize,
 };
 
+const ClientSubscriptions = struct {
+    allocator: std.mem.Allocator,
+    channels: std.ArrayList([]u8),
+
+    fn init(allocator: std.mem.Allocator) ClientSubscriptions {
+        return .{
+            .allocator = allocator,
+            .channels = .empty,
+        };
+    }
+
+    fn deinit(self: *ClientSubscriptions) void {
+        for (self.channels.items) |channel| {
+            self.allocator.free(channel);
+        }
+        self.channels.deinit(self.allocator);
+    }
+
+    fn subscribe(self: *ClientSubscriptions, channel: []const u8) !usize {
+        for (self.channels.items) |existing_channel| {
+            if (std.mem.eql(u8, existing_channel, channel)) {
+                return self.channels.items.len;
+            }
+        }
+
+        try self.channels.append(self.allocator, try self.allocator.dupe(u8, channel));
+        return self.channels.items.len;
+    }
+};
+
 const QueuedCommand = struct {
     name: []u8,
     args: std.ArrayList([]u8),
@@ -895,9 +925,11 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
     var buffer: [1024]u8 = undefined;
     var in_transaction = false;
     var queued_commands: std.ArrayList(QueuedCommand) = .empty;
+    var subscriptions = ClientSubscriptions.init(database.allocator);
     defer {
         clearQueuedCommands(database.allocator, &queued_commands);
         queued_commands.deinit(database.allocator);
+        subscriptions.deinit();
     }
     while (true) {
         const bytes_read = client.stream.read(&buffer) catch 0;
@@ -922,7 +954,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, config, role, queued_command.toRespCommand(), true, 0);
+                try executeCommand(&client.stream, database, replicas, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -939,7 +971,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, config, role, command, true, 0);
+            try executeCommand(&client.stream, database, replicas, &subscriptions, config, role, command, true, 0);
         }
     }
 }
@@ -1082,7 +1114,9 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     var pending: std.ArrayList(u8) = .empty;
     var replication_offset: u64 = 0;
     const config = ServerConfig{};
+    var subscriptions = ClientSubscriptions.init(database.allocator);
     defer pending.deinit(database.allocator);
+    defer subscriptions.deinit();
 
     while (true) {
         const bytes_read = stream.read(&read_buffer) catch 0;
@@ -1098,7 +1132,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, &config, .slave, parsed.command, false, replication_offset);
+            try executeCommand(stream, database, replicas, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
             replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
@@ -1108,7 +1142,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             try stream.writeAll("+PONG\r\n");
@@ -1167,11 +1201,14 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "subscribe")) {
         if (command.arg_count < 1 or !should_reply) return;
+        const subscription_count = try subscriptions.subscribe(command.args[0]);
 
         try stream.writeAll("*3\r\n");
         try writeBulkString(stream, "subscribe");
         try writeBulkString(stream, command.args[0]);
-        try stream.writeAll(":1\r\n");
+        var integer_buffer: [32]u8 = undefined;
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
+        try stream.writeAll(integer);
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
         const key = command.args[0];
