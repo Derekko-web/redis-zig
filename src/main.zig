@@ -769,7 +769,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand(), true);
+                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -786,7 +786,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, role, command, true);
+            try executeCommand(&client.stream, database, replicas, role, command, true, 0);
         }
     }
 }
@@ -911,6 +911,7 @@ fn skipRdbFile(stream: anytype) !void {
 fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: *ReplicaRegistry) !void {
     var read_buffer: [1024]u8 = undefined;
     var pending: std.ArrayList(u8) = .empty;
+    var replication_offset: u64 = 0;
     defer pending.deinit(database.allocator);
 
     while (true) {
@@ -927,7 +928,8 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, .slave, parsed.command, false);
+            try executeCommand(stream, database, replicas, .slave, parsed.command, false, replication_offset);
+            replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
             std.mem.copyForwards(u8, pending.items[0..remaining_len], pending.items[parsed.bytes_consumed..]);
@@ -936,7 +938,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand, should_reply: bool) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             try stream.writeAll("+PONG\r\n");
@@ -946,7 +948,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             std.ascii.eqlIgnoreCase(command.args[0], "getack") and
             std.mem.eql(u8, command.args[1], "*"))
         {
-            try writeRespArrayCommand(stream, &.{ "REPLCONF", "ACK", "0" });
+            var offset_buffer: [32]u8 = undefined;
+            const offset_text = try std.fmt.bufPrint(&offset_buffer, "{d}", .{replication_offset});
+            try writeRespArrayCommand(stream, &.{ "REPLCONF", "ACK", offset_text });
         } else if (should_reply) {
             try stream.writeAll("+OK\r\n");
         }
