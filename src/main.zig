@@ -4,6 +4,7 @@ const net = std.net;
 const max_command_args = 64;
 const default_master_replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const default_master_repl_offset: u64 = 0;
+const empty_rdb_hex = "524544495330303133fa0972656469732d76657205382e362e31fa0a72656469732d62697473c040fa056374696d65c23757c869fa08757365642d6d656dc2d0a60d00fa08616f662d62617365c000ff5589d80cb52b60c2";
 
 const ServerRole = enum {
     master,
@@ -810,6 +811,7 @@ fn executeCommand(stream: anytype, database: *Database, role: ServerRole, comman
             default_master_repl_offset,
         });
         try stream.writeAll(fullresync);
+        try writeEmptyRdb(stream);
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
             try writeInfoReplication(stream, role);
@@ -1126,6 +1128,16 @@ fn writeInfoReplication(stream: anytype, role: ServerRole) !void {
     });
 
     try writeBulkString(stream, info);
+}
+
+fn writeEmptyRdb(stream: anytype) !void {
+    var rdb_buffer: [empty_rdb_hex.len / 2]u8 = undefined;
+    const rdb = try std.fmt.hexToBytes(&rdb_buffer, empty_rdb_hex);
+
+    var header_buffer: [32]u8 = undefined;
+    const header = try std.fmt.bufPrint(&header_buffer, "${d}\r\n", .{rdb.len});
+    try stream.writeAll(header);
+    try stream.writeAll(rdb);
 }
 
 fn parseCommand(data: []const u8) ?RespCommand {
