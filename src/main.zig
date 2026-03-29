@@ -337,6 +337,21 @@ const ClientSubscriptions = struct {
         return self.channels.items.len;
     }
 
+    fn unsubscribe(self: *ClientSubscriptions, pubsub: *PubSubRegistry, stream: *net.Stream, channel: []const u8) usize {
+        for (self.channels.items, 0..) |existing_channel, index| {
+            if (!std.mem.eql(u8, existing_channel, channel)) {
+                continue;
+            }
+
+            pubsub.unsubscribe(channel, stream);
+            const removed_channel = self.channels.orderedRemove(index);
+            self.allocator.free(removed_channel);
+            return self.channels.items.len;
+        }
+
+        return self.channels.items.len;
+    }
+
     fn clear(self: *ClientSubscriptions, pubsub: *PubSubRegistry, stream: *net.Stream) void {
         for (self.channels.items) |channel| {
             pubsub.unsubscribe(channel, stream);
@@ -1376,6 +1391,22 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         var integer_buffer: [32]u8 = undefined;
         const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
         try stream.writeAll(integer);
+    } else if (std.ascii.eqlIgnoreCase(command.name, "unsubscribe")) {
+        if (!should_reply) return;
+        if (command.arg_count < 1) return;
+
+        var arg_index: usize = 0;
+        while (arg_index < command.arg_count) : (arg_index += 1) {
+            const channel = command.args[arg_index];
+            const subscription_count = subscriptions.unsubscribe(pubsub, stream, channel);
+
+            try stream.writeAll("*3\r\n");
+            try writeBulkString(stream, "unsubscribe");
+            try writeBulkString(stream, channel);
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
+            try stream.writeAll(integer);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "reset")) {
         subscriptions.clear(pubsub, stream);
         if (should_reply) {
