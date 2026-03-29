@@ -1609,9 +1609,10 @@ fn readRdbLength(file_contents: []const u8, index: *usize) !usize {
         },
         0b10 => blk: {
             const value = try readRdbInt(u32, file_contents, index, .big);
-            break :blk value;
+            break :blk @as(usize, value);
         },
         0b11 => return error.UnsupportedRdbLengthEncoding,
+        else => unreachable,
     };
 }
 
@@ -1665,7 +1666,8 @@ fn readRdbInt(comptime T: type, file_contents: []const u8, index: *usize, endian
     }
 
     index.* = value_end;
-    return std.mem.readInt(T, file_contents[value_start..value_end], endian);
+    const bytes: *const [byte_len]u8 = file_contents[value_start..][0..byte_len];
+    return std.mem.readInt(T, bytes, endian);
 }
 
 fn parseNextCommand(data: []const u8) error{ Incomplete, Invalid }!ParsedCommand {
