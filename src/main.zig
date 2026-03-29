@@ -643,6 +643,25 @@ const Database = struct {
         return member_count;
     }
 
+    fn zrem(self: *Database, key: []const u8, member: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.zsets.items, 0..) |entry, index| {
+            if (!std.mem.eql(u8, entry.key, key) or !std.mem.eql(u8, entry.member, member)) {
+                continue;
+            }
+
+            const removed = self.zsets.orderedRemove(index);
+            self.allocator.free(removed.key);
+            self.allocator.free(removed.member);
+            self.allocator.free(removed.score_text);
+            return 1;
+        }
+
+        return 0;
+    }
+
     fn zscore(self: *Database, key: []const u8, member: []const u8) ?[]const u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1702,6 +1721,24 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
 
         if (should_reply) {
             try writeBulkString(stream, score);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zrem")) {
+        if (command.arg_count < 2) return;
+
+        const key = command.args[0];
+        var removed_members: usize = 0;
+        var arg_index: usize = 1;
+        while (arg_index < command.arg_count) : (arg_index += 1) {
+            removed_members += database.zrem(key, command.args[arg_index]);
+        }
+
+        if (should_reply) {
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{removed_members});
+            try stream.writeAll(integer);
+        }
+        if (role == .master) {
+            try replicas.propagate(command);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
