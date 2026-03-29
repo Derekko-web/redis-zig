@@ -1534,6 +1534,21 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (role == .master) {
             try replicas.propagate(command);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zrank")) {
+        if (command.arg_count < 2) return;
+
+        const rank = database.zrank(command.args[0], command.args[1]) orelse {
+            if (should_reply) {
+                try stream.writeAll("$-1\r\n");
+            }
+            return;
+        };
+
+        if (should_reply) {
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{rank});
+            try stream.writeAll(integer);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
         const requested_replicas = std.fmt.parseInt(usize, command.args[0], 10) catch return;
