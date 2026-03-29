@@ -1742,10 +1742,12 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             if (command.arg_count < 2) return;
             if (!std.mem.eql(u8, command.args[1], "default")) return;
             if (should_reply) {
-                try stream.writeAll("*2\r\n");
+                try stream.writeAll("*4\r\n");
                 try writeBulkString(stream, "flags");
                 try stream.writeAll("*1\r\n");
                 try writeBulkString(stream, "nopass");
+                try writeBulkString(stream, "passwords");
+                try stream.writeAll("*0\r\n");
             }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
