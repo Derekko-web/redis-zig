@@ -1743,6 +1743,7 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
     } else if (std.ascii.eqlIgnoreCase(command.name, "geoadd")) {
         if (command.arg_count < 4 or (command.arg_count - 1) % 3 != 0) return;
 
+        const key = command.args[0];
         var arg_index: usize = 1;
         while (arg_index < command.arg_count) : (arg_index += 3) {
             const longitude = std.fmt.parseFloat(f64, command.args[arg_index]) catch {
@@ -1774,11 +1775,20 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             }
         }
 
+        var added_locations: usize = 0;
+        arg_index = 1;
+        while (arg_index < command.arg_count) : (arg_index += 3) {
+            const member = command.args[arg_index + 2];
+            added_locations += try database.zadd(key, 0.0, "0", member);
+        }
+
         if (should_reply) {
-            const added_locations = (command.arg_count - 1) / 3;
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{added_locations});
             try stream.writeAll(integer);
+        }
+        if (role == .master) {
+            try replicas.propagate(command);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
