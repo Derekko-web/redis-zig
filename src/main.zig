@@ -10,6 +10,7 @@ const geo_lat_min = -85.05112878;
 const geo_lat_max = 85.05112878;
 const geo_long_min = -180.0;
 const geo_long_max = 180.0;
+const earth_radius_in_meters = 6372797.560856;
 
 const ServerRole = enum {
     master,
@@ -1483,6 +1484,29 @@ fn geoPositionFromScore(score: u64) GeoPosition {
     };
 }
 
+fn degreesToRadians(value: f64) f64 {
+    return value * (std.math.pi / 180.0);
+}
+
+fn geoLatitudeDistanceMeters(latitude_1: f64, latitude_2: f64) f64 {
+    return earth_radius_in_meters * @abs(degreesToRadians(latitude_2) - degreesToRadians(latitude_1));
+}
+
+fn geoDistanceMeters(longitude_1: f64, latitude_1: f64, longitude_2: f64, latitude_2: f64) f64 {
+    const longitude_1_radians = degreesToRadians(longitude_1);
+    const longitude_2_radians = degreesToRadians(longitude_2);
+    const v = std.math.sin((longitude_2_radians - longitude_1_radians) / 2.0);
+    if (v == 0.0) {
+        return geoLatitudeDistanceMeters(latitude_1, latitude_2);
+    }
+
+    const latitude_1_radians = degreesToRadians(latitude_1);
+    const latitude_2_radians = degreesToRadians(latitude_2);
+    const u = std.math.sin((latitude_2_radians - latitude_1_radians) / 2.0);
+    const a = u * u + std.math.cos(latitude_1_radians) * std.math.cos(latitude_2_radians) * v * v;
+    return 2.0 * earth_radius_in_meters * std.math.asin(std.math.sqrt(a));
+}
+
 fn interleave64(x_input: u32, y_input: u32) u64 {
     var x: u64 = x_input;
     var y: u64 = y_input;
@@ -1906,6 +1930,36 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
                     try stream.writeAll("*-1\r\n");
                 }
             }
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "geodist")) {
+        if (command.arg_count < 3) return;
+
+        const first_score = database.zscoreValue(command.args[0], command.args[1]) orelse {
+            if (should_reply) {
+                try stream.writeAll("$-1\r\n");
+            }
+            return;
+        };
+        const second_score = database.zscoreValue(command.args[0], command.args[2]) orelse {
+            if (should_reply) {
+                try stream.writeAll("$-1\r\n");
+            }
+            return;
+        };
+
+        if (should_reply) {
+            const first_position = geoPositionFromScore(@intFromFloat(first_score));
+            const second_position = geoPositionFromScore(@intFromFloat(second_score));
+            const distance = geoDistanceMeters(
+                first_position.longitude,
+                first_position.latitude,
+                second_position.longitude,
+                second_position.latitude,
+            );
+
+            var distance_buffer: [64]u8 = undefined;
+            const distance_text = try std.fmt.bufPrint(&distance_buffer, "{d:.4}", .{distance});
+            try writeBulkString(stream, distance_text);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
