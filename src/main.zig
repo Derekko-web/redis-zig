@@ -237,6 +237,13 @@ const AclState = struct {
         return false;
     }
 
+    fn shouldAutoAuthenticateDefault(self: *AclState) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.nopass;
+    }
+
     fn writeGetUserDefault(self: *AclState, stream: anytype) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1427,6 +1434,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
 
     var buffer: [1024]u8 = undefined;
     var in_transaction = false;
+    var authenticated = acl.shouldAutoAuthenticateDefault();
     var queued_commands: std.ArrayList(QueuedCommand) = .empty;
     var subscriptions = ClientSubscriptions.init(database.allocator);
     defer {
@@ -1441,6 +1449,10 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
         }
 
         const command = parseCommand(buffer[0..bytes_read]) orelse continue;
+        if (!authenticated and !isUnauthenticatedCommandAllowed(command.name)) {
+            try client.stream.writeAll("-NOAUTH Authentication required.\r\n");
+            continue;
+        }
         if (subscriptions.count() > 0 and !isSubscribedModeCommandAllowed(command.name)) {
             var error_buffer: [256]u8 = undefined;
             const error_message = try std.fmt.bufPrint(&error_buffer, "-ERR Can't execute '{s}' in subscribed mode\r\n", .{command.name});
@@ -1466,7 +1478,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, pubsub, acl, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
+                try executeCommand(&client.stream, database, replicas, pubsub, acl, &authenticated, &subscriptions, config, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -1483,7 +1495,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, pubsub, acl, &subscriptions, config, role, command, true, 0);
+            try executeCommand(&client.stream, database, replicas, pubsub, acl, &authenticated, &subscriptions, config, role, command, true, 0);
         }
     }
 }
@@ -1503,6 +1515,11 @@ fn isSubscribedModeCommandAllowed(command_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(command_name, "ping") or
         std.ascii.eqlIgnoreCase(command_name, "quit") or
         std.ascii.eqlIgnoreCase(command_name, "reset");
+}
+
+fn isUnauthenticatedCommandAllowed(command_name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(command_name, "auth") or
+        std.ascii.eqlIgnoreCase(command_name, "quit");
 }
 
 fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16, database: *Database, replicas: *ReplicaRegistry, acl: *AclState) !void {
@@ -1748,7 +1765,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, &pubsub, acl, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
+            try executeCommand(stream, database, replicas, &pubsub, acl, null, &subscriptions, &config, .slave, parsed.command, false, replication_offset);
             replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
@@ -1758,7 +1775,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, acl: *AclState, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, pubsub: *PubSubRegistry, acl: *AclState, authenticated: ?*bool, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             if (subscriptions.count() > 0) {
@@ -1850,6 +1867,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (!should_reply) return;
 
         if (acl.authenticate(command.args[0], command.args[1])) {
+            if (authenticated) |auth_state| {
+                auth_state.* = true;
+            }
             try stream.writeAll("+OK\r\n");
         } else {
             try stream.writeAll("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
