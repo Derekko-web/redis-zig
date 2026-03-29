@@ -625,7 +625,7 @@ const Database = struct {
         return rank;
     }
 
-    fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: usize, stop: usize) !void {
+    fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -636,7 +636,7 @@ const Database = struct {
             }
         }
 
-        if (member_count == 0 or start >= member_count) {
+        if (member_count == 0) {
             try stream.writeAll("*0\r\n");
             return;
         }
@@ -674,19 +674,41 @@ const Database = struct {
             }
         }
 
-        const bounded_stop = @min(stop, members.len - 1);
-        if (start > bounded_stop) {
+        const member_count_i64: i64 = @intCast(member_count);
+        var resolved_start = start;
+        if (resolved_start < 0) {
+            resolved_start += member_count_i64;
+        }
+        if (resolved_start < 0) {
+            resolved_start = 0;
+        }
+
+        var resolved_stop = stop;
+        if (resolved_stop < 0) {
+            resolved_stop += member_count_i64;
+        }
+        if (resolved_stop < 0) {
+            resolved_stop = 0;
+        }
+
+        if (resolved_start >= member_count_i64 or resolved_start > resolved_stop) {
             try stream.writeAll("*0\r\n");
             return;
         }
 
-        const response_len = bounded_stop - start + 1;
+        if (resolved_stop >= member_count_i64) {
+            resolved_stop = member_count_i64 - 1;
+        }
+
+        const range_start: usize = @intCast(resolved_start);
+        const range_end: usize = @intCast(resolved_stop);
+        const response_len = range_end - range_start + 1;
         var header_buffer: [32]u8 = undefined;
         const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{response_len});
         try stream.writeAll(header);
 
-        var response_index = start;
-        while (response_index <= bounded_stop) : (response_index += 1) {
+        var response_index = range_start;
+        while (response_index <= range_end) : (response_index += 1) {
             try writeBulkString(stream, members[response_index].member);
         }
     }
@@ -1623,8 +1645,8 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
     } else if (std.ascii.eqlIgnoreCase(command.name, "zrange")) {
         if (command.arg_count < 3) return;
 
-        const start = std.fmt.parseInt(usize, command.args[1], 10) catch return;
-        const stop = std.fmt.parseInt(usize, command.args[2], 10) catch return;
+        const start = std.fmt.parseInt(i64, command.args[1], 10) catch return;
+        const stop = std.fmt.parseInt(i64, command.args[2], 10) catch return;
         if (should_reply) {
             try database.writeZRange(stream, command.args[0], start, stop);
         }
