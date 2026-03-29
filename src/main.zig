@@ -593,6 +593,33 @@ const Database = struct {
         return 1;
     }
 
+    fn zrank(self: *Database, key: []const u8, member: []const u8) ?usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var target_score: ?f64 = null;
+        for (self.zsets.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key) and std.mem.eql(u8, entry.member, member)) {
+                target_score = entry.score;
+                break;
+            }
+        }
+
+        const score = target_score orelse return null;
+        var rank: usize = 0;
+        for (self.zsets.items) |entry| {
+            if (!std.mem.eql(u8, entry.key, key)) {
+                continue;
+            }
+
+            if (entry.score < score or (entry.score == score and std.mem.order(u8, entry.member, member) == .lt)) {
+                rank += 1;
+            }
+        }
+
+        return rank;
+    }
+
     fn xadd(self: *Database, key: []const u8, id: []const u8, field_values: []const []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
