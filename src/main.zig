@@ -1743,6 +1743,37 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
     } else if (std.ascii.eqlIgnoreCase(command.name, "geoadd")) {
         if (command.arg_count < 4 or (command.arg_count - 1) % 3 != 0) return;
 
+        var arg_index: usize = 1;
+        while (arg_index < command.arg_count) : (arg_index += 3) {
+            const longitude = std.fmt.parseFloat(f64, command.args[arg_index]) catch {
+                if (should_reply) {
+                    try stream.writeAll("-ERR invalid longitude value\r\n");
+                }
+                return;
+            };
+            const latitude = std.fmt.parseFloat(f64, command.args[arg_index + 1]) catch {
+                if (should_reply) {
+                    try stream.writeAll("-ERR invalid latitude value\r\n");
+                }
+                return;
+            };
+
+            const invalid_longitude = longitude < -180.0 or longitude > 180.0;
+            const invalid_latitude = latitude < -85.05112878 or latitude > 85.05112878;
+            if (invalid_longitude or invalid_latitude) {
+                if (should_reply) {
+                    if (invalid_longitude and invalid_latitude) {
+                        try stream.writeAll("-ERR invalid longitude,latitude pair\r\n");
+                    } else if (invalid_longitude) {
+                        try stream.writeAll("-ERR invalid longitude value\r\n");
+                    } else {
+                        try stream.writeAll("-ERR invalid latitude value\r\n");
+                    }
+                }
+                return;
+            }
+        }
+
         if (should_reply) {
             const added_locations = (command.arg_count - 1) / 3;
             var integer_buffer: [32]u8 = undefined;
