@@ -5,6 +5,11 @@ const max_command_args = 64;
 const default_master_replid = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 const default_master_repl_offset: u64 = 0;
 const empty_rdb_hex = "524544495330303131fa0972656469732d76657205372e322e30fa0a72656469732d62697473c040fa056374696d65c26d08bc65fa08757365642d6d656dc2b0c41000fa08616f662d62617365c000fff06e3bfec0ff5aa2";
+const geo_step_max = 26;
+const geo_lat_min = -85.05112878;
+const geo_lat_max = 85.05112878;
+const geo_long_min = -180.0;
+const geo_long_max = 180.0;
 
 const ServerRole = enum {
     master,
@@ -1436,6 +1441,31 @@ fn respBulkStringLength(value: []const u8) u64 {
     return std.fmt.count("${d}\r\n", .{value.len}) + value.len + 2;
 }
 
+fn geoLocationScore(longitude: f64, latitude: f64) u64 {
+    const scale: f64 = @floatFromInt(@as(u64, 1) << geo_step_max);
+    const latitude_offset: u32 = @intFromFloat(((latitude - geo_lat_min) / (geo_lat_max - geo_lat_min)) * scale);
+    const longitude_offset: u32 = @intFromFloat(((longitude - geo_long_min) / (geo_long_max - geo_long_min)) * scale);
+    return interleave64(latitude_offset, longitude_offset);
+}
+
+fn interleave64(x_input: u32, y_input: u32) u64 {
+    var x: u64 = x_input;
+    var y: u64 = y_input;
+
+    x = (x | (x << 16)) & 0x0000FFFF0000FFFF;
+    y = (y | (y << 16)) & 0x0000FFFF0000FFFF;
+    x = (x | (x << 8)) & 0x00FF00FF00FF00FF;
+    y = (y | (y << 8)) & 0x00FF00FF00FF00FF;
+    x = (x | (x << 4)) & 0x0F0F0F0F0F0F0F0F;
+    y = (y | (y << 4)) & 0x0F0F0F0F0F0F0F0F;
+    x = (x | (x << 2)) & 0x3333333333333333;
+    y = (y | (y << 2)) & 0x3333333333333333;
+    x = (x | (x << 1)) & 0x5555555555555555;
+    y = (y | (y << 1)) & 0x5555555555555555;
+
+    return x | (y << 1);
+}
+
 fn readLine(stream: anytype, buffer: []u8) ![]const u8 {
     var line_len: usize = 0;
 
@@ -1778,8 +1808,14 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         var added_locations: usize = 0;
         arg_index = 1;
         while (arg_index < command.arg_count) : (arg_index += 3) {
+            const longitude = std.fmt.parseFloat(f64, command.args[arg_index]) catch unreachable;
+            const latitude = std.fmt.parseFloat(f64, command.args[arg_index + 1]) catch unreachable;
             const member = command.args[arg_index + 2];
-            added_locations += try database.zadd(key, 0.0, "0", member);
+            const score = geoLocationScore(longitude, latitude);
+            const score_float: f64 = @floatFromInt(score);
+            var score_buffer: [32]u8 = undefined;
+            const score_text = try std.fmt.bufPrint(&score_buffer, "{d}", .{score});
+            added_locations += try database.zadd(key, score_float, score_text, member);
         }
 
         if (should_reply) {
