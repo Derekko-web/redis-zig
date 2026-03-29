@@ -185,7 +185,7 @@ const ParsedCommand = struct {
 
 const PubSubChannel = struct {
     name: []u8,
-    subscriber_count: usize,
+    subscribers: std.ArrayList(*net.Stream),
 };
 
 const PubSubRegistry = struct {
@@ -200,24 +200,34 @@ const PubSubRegistry = struct {
         };
     }
 
-    fn subscribe(self: *PubSubRegistry, channel: []const u8) !void {
+    fn subscribe(self: *PubSubRegistry, channel: []const u8, stream: *net.Stream) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
         for (self.channels.items) |*existing_channel| {
             if (std.mem.eql(u8, existing_channel.name, channel)) {
-                existing_channel.subscriber_count += 1;
+                for (existing_channel.subscribers.items) |subscriber| {
+                    if (subscriber == stream) {
+                        return;
+                    }
+                }
+
+                try existing_channel.subscribers.append(self.allocator, stream);
                 return;
             }
         }
 
+        var subscribers: std.ArrayList(*net.Stream) = .empty;
+        errdefer subscribers.deinit(self.allocator);
+        try subscribers.append(self.allocator, stream);
+
         try self.channels.append(self.allocator, .{
             .name = try self.allocator.dupe(u8, channel),
-            .subscriber_count = 1,
+            .subscribers = subscribers,
         });
     }
 
-    fn unsubscribe(self: *PubSubRegistry, channel: []const u8) void {
+    fn unsubscribe(self: *PubSubRegistry, channel: []const u8, stream: *net.Stream) void {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -226,9 +236,15 @@ const PubSubRegistry = struct {
                 continue;
             }
 
-            if (existing_channel.subscriber_count > 1) {
-                existing_channel.subscriber_count -= 1;
-            } else {
+            for (existing_channel.subscribers.items, 0..) |subscriber, subscriber_index| {
+                if (subscriber == stream) {
+                    _ = existing_channel.subscribers.orderedRemove(subscriber_index);
+                    break;
+                }
+            }
+
+            if (existing_channel.subscribers.items.len == 0) {
+                existing_channel.subscribers.deinit(self.allocator);
                 self.allocator.free(existing_channel.name);
                 _ = self.channels.orderedRemove(index);
             }
@@ -242,8 +258,42 @@ const PubSubRegistry = struct {
 
         for (self.channels.items) |existing_channel| {
             if (std.mem.eql(u8, existing_channel.name, channel)) {
-                return existing_channel.subscriber_count;
+                return existing_channel.subscribers.items.len;
             }
+        }
+
+        return 0;
+    }
+
+    fn publish(self: *PubSubRegistry, channel: []const u8, message: []const u8) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.channels.items, 0..) |*existing_channel, channel_index| {
+            if (!std.mem.eql(u8, existing_channel.name, channel)) {
+                continue;
+            }
+
+            var delivered_count: usize = 0;
+            var subscriber_index: usize = 0;
+            while (subscriber_index < existing_channel.subscribers.items.len) {
+                const subscriber = existing_channel.subscribers.items[subscriber_index];
+                writePubSubMessage(subscriber, channel, message) catch {
+                    _ = existing_channel.subscribers.orderedRemove(subscriber_index);
+                    continue;
+                };
+
+                delivered_count += 1;
+                subscriber_index += 1;
+            }
+
+            if (existing_channel.subscribers.items.len == 0) {
+                existing_channel.subscribers.deinit(self.allocator);
+                self.allocator.free(existing_channel.name);
+                _ = self.channels.orderedRemove(channel_index);
+            }
+
+            return delivered_count;
         }
 
         return 0;
@@ -261,12 +311,12 @@ const ClientSubscriptions = struct {
         };
     }
 
-    fn deinit(self: *ClientSubscriptions, pubsub: *PubSubRegistry) void {
-        self.clear(pubsub);
+    fn deinit(self: *ClientSubscriptions, pubsub: *PubSubRegistry, stream: *net.Stream) void {
+        self.clear(pubsub, stream);
         self.channels.deinit(self.allocator);
     }
 
-    fn subscribe(self: *ClientSubscriptions, pubsub: *PubSubRegistry, channel: []const u8) !usize {
+    fn subscribe(self: *ClientSubscriptions, pubsub: *PubSubRegistry, stream: *net.Stream, channel: []const u8) !usize {
         for (self.channels.items) |existing_channel| {
             if (std.mem.eql(u8, existing_channel, channel)) {
                 return self.channels.items.len;
@@ -279,7 +329,7 @@ const ClientSubscriptions = struct {
         try self.channels.append(self.allocator, owned_channel);
         errdefer _ = self.channels.pop();
 
-        try pubsub.subscribe(channel);
+        try pubsub.subscribe(channel, stream);
         return self.channels.items.len;
     }
 
@@ -287,9 +337,9 @@ const ClientSubscriptions = struct {
         return self.channels.items.len;
     }
 
-    fn clear(self: *ClientSubscriptions, pubsub: *PubSubRegistry) void {
+    fn clear(self: *ClientSubscriptions, pubsub: *PubSubRegistry, stream: *net.Stream) void {
         for (self.channels.items) |channel| {
-            pubsub.unsubscribe(channel);
+            pubsub.unsubscribe(channel, stream);
             self.allocator.free(channel);
         }
         self.channels.clearRetainingCapacity();
@@ -1013,7 +1063,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
     defer {
         clearQueuedCommands(database.allocator, &queued_commands);
         queued_commands.deinit(database.allocator);
-        subscriptions.deinit(pubsub);
+        subscriptions.deinit(pubsub, &client.stream);
     }
     while (true) {
         const bytes_read = client.stream.read(&buffer) catch 0;
@@ -1135,6 +1185,13 @@ fn writeRespCommand(stream: anytype, command: RespCommand) !void {
     }
 }
 
+fn writePubSubMessage(stream: anytype, channel: []const u8, message: []const u8) !void {
+    try stream.writeAll("*3\r\n");
+    try writeBulkString(stream, "message");
+    try writeBulkString(stream, channel);
+    try writeBulkString(stream, message);
+}
+
 fn respCommandLength(command: RespCommand) u64 {
     var total_len: u64 = std.fmt.count("*{d}\r\n", .{command.arg_count + 1});
     total_len += respBulkStringLength(command.name);
@@ -1220,7 +1277,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     var pubsub = PubSubRegistry.init(database.allocator);
     var subscriptions = ClientSubscriptions.init(database.allocator);
     defer pending.deinit(database.allocator);
-    defer subscriptions.deinit(&pubsub);
+    defer subscriptions.deinit(&pubsub, stream);
 
     while (true) {
         const bytes_read = stream.read(&read_buffer) catch 0;
@@ -1311,7 +1368,7 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "subscribe")) {
         if (command.arg_count < 1 or !should_reply) return;
-        const subscription_count = try subscriptions.subscribe(pubsub, command.args[0]);
+        const subscription_count = try subscriptions.subscribe(pubsub, stream, command.args[0]);
 
         try stream.writeAll("*3\r\n");
         try writeBulkString(stream, "subscribe");
@@ -1320,7 +1377,7 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{subscription_count});
         try stream.writeAll(integer);
     } else if (std.ascii.eqlIgnoreCase(command.name, "reset")) {
-        subscriptions.clear(pubsub);
+        subscriptions.clear(pubsub, stream);
         if (should_reply) {
             try stream.writeAll("+RESET\r\n");
         }
@@ -1328,7 +1385,8 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (command.arg_count < 2 or !should_reply) return;
 
         var integer_buffer: [32]u8 = undefined;
-        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{pubsub.countSubscribers(command.args[0])});
+        const published_count = try pubsub.publish(command.args[0], command.args[1]);
+        const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{published_count});
         try stream.writeAll(integer);
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
