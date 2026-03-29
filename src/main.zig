@@ -16,6 +16,11 @@ const ReplicaOf = struct {
     port: u16,
 };
 
+const ServerConfig = struct {
+    dir: []const u8 = "",
+    dbfilename: []const u8 = "",
+};
+
 const ReplicaState = struct {
     stream: *net.Stream,
     ack_offset: u64 = 0,
@@ -771,6 +776,7 @@ pub fn main() !void {
     var port: u16 = 6379;
     var role: ServerRole = .master;
     var replicaof: ?ReplicaOf = null;
+    var config = ServerConfig{};
     var arg_index: usize = 1;
     while (arg_index < args.len) : (arg_index += 1) {
         if (std.mem.eql(u8, args[arg_index], "--port")) {
@@ -802,6 +808,20 @@ pub fn main() !void {
                 .host = host,
                 .port = try std.fmt.parseInt(u16, port_text, 10),
             };
+        } else if (std.mem.eql(u8, args[arg_index], "--dir")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                return error.MissingDirValue;
+            }
+
+            config.dir = args[arg_index];
+        } else if (std.mem.eql(u8, args[arg_index], "--dbfilename")) {
+            arg_index += 1;
+            if (arg_index >= args.len) {
+                return error.MissingDbFilenameValue;
+            }
+
+            config.dbfilename = args[arg_index];
         }
     }
 
@@ -824,12 +844,12 @@ pub fn main() !void {
 
         try stdout.writeAll("accepted new connection\n");
 
-        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, role });
+        const thread = try std.Thread.spawn(.{}, handleConnection, .{ connection, &database, &replicas, &config, role });
         thread.detach();
     }
 }
 
-fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, role: ServerRole) !void {
+fn handleConnection(connection: std.net.Server.Connection, database: *Database, replicas: *ReplicaRegistry, config: *const ServerConfig, role: ServerRole) !void {
     var client = connection;
     defer {
         replicas.unregister(&client.stream);
@@ -866,7 +886,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand(), true, 0);
+                try executeCommand(&client.stream, database, replicas, config, role, queued_command.toRespCommand(), true, 0);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -883,7 +903,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, role, command, true, 0);
+            try executeCommand(&client.stream, database, replicas, config, role, command, true, 0);
         }
     }
 }
@@ -1025,6 +1045,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     var read_buffer: [1024]u8 = undefined;
     var pending: std.ArrayList(u8) = .empty;
     var replication_offset: u64 = 0;
+    const config = ServerConfig{};
     defer pending.deinit(database.allocator);
 
     while (true) {
@@ -1041,7 +1062,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
                 error.Invalid => return error.InvalidReplicationCommand,
             };
 
-            try executeCommand(stream, database, replicas, .slave, parsed.command, false, replication_offset);
+            try executeCommand(stream, database, replicas, &config, .slave, parsed.command, false, replication_offset);
             replication_offset += parsed.bytes_consumed;
 
             const remaining_len = pending.items.len - parsed.bytes_consumed;
@@ -1051,7 +1072,7 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
             try stream.writeAll("+PONG\r\n");
@@ -1084,6 +1105,23 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             if (should_reply) {
                 try writeInfoReplication(stream, role);
             }
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "config")) {
+        if (command.arg_count < 2) return;
+        if (!std.ascii.eqlIgnoreCase(command.args[0], "get")) return;
+        if (!should_reply) return;
+
+        const parameter = command.args[1];
+        if (std.ascii.eqlIgnoreCase(parameter, "dir")) {
+            try stream.writeAll("*2\r\n");
+            try writeBulkString(stream, "dir");
+            try writeBulkString(stream, config.dir);
+        } else if (std.ascii.eqlIgnoreCase(parameter, "dbfilename")) {
+            try stream.writeAll("*2\r\n");
+            try writeBulkString(stream, "dbfilename");
+            try writeBulkString(stream, config.dbfilename);
+        } else {
+            try stream.writeAll("*0\r\n");
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
@@ -1126,7 +1164,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             const target_offset = replicas.replicationOffset();
             var acknowledged_replicas = replicas.countAcked(target_offset);
 
-            if (target_offset > 0 and acknowledged_replicas < requested_replicas) {
+            if (replicas.count() == 0) {
+                acknowledged_replicas = 0;
+            } else if (target_offset > 0 and acknowledged_replicas < requested_replicas) {
                 acknowledged_replicas = try replicas.waitForAcks(target_offset, requested_replicas, timeout_ms);
             }
 
