@@ -942,7 +942,12 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             try stream.writeAll("+PONG\r\n");
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
-        if (should_reply) {
+        if (!should_reply and role == .slave and command.arg_count >= 2 and
+            std.ascii.eqlIgnoreCase(command.args[0], "getack") and
+            std.mem.eql(u8, command.args[1], "*"))
+        {
+            try writeRespArrayCommand(stream, &.{ "REPLCONF", "ACK", "0" });
+        } else if (should_reply) {
             try stream.writeAll("+OK\r\n");
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "psync")) {
