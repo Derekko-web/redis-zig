@@ -1001,6 +1001,14 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (role == .master) {
             try replicas.propagate(command);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
+        if (command.arg_count < 2) return;
+        _ = std.fmt.parseInt(usize, command.args[0], 10) catch return;
+        _ = std.fmt.parseInt(u64, command.args[1], 10) catch return;
+
+        if (should_reply) {
+            try stream.writeAll(":0\r\n");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
         if (command.arg_count < 1) return;
         const key = command.args[0];
