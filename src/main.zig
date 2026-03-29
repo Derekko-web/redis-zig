@@ -1826,6 +1826,26 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (role == .master) {
             try replicas.propagate(command);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "geopos")) {
+        if (command.arg_count < 2) return;
+
+        if (should_reply) {
+            var header_buffer: [32]u8 = undefined;
+            const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{command.arg_count - 1});
+            try stream.writeAll(header);
+
+            const key = command.args[0];
+            var arg_index: usize = 1;
+            while (arg_index < command.arg_count) : (arg_index += 1) {
+                if (database.zscore(key, command.args[arg_index]) != null) {
+                    try stream.writeAll("*2\r\n");
+                    try writeBulkString(stream, "0");
+                    try writeBulkString(stream, "0");
+                } else {
+                    try stream.writeAll("*-1\r\n");
+                }
+            }
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
         const requested_replicas = std.fmt.parseInt(usize, command.args[0], 10) catch return;
