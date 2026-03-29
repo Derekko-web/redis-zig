@@ -321,6 +321,41 @@ const Database = struct {
         return null;
     }
 
+    fn writeKeys(self: *Database, stream: anytype, pattern: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (!std.mem.eql(u8, pattern, "*")) {
+            try stream.writeAll("*0\r\n");
+            return;
+        }
+
+        var key_count: usize = 0;
+        for (self.entries.items) |entry| {
+            if (entry.expires_at_ms) |expires_at_ms| {
+                if (std.time.milliTimestamp() >= expires_at_ms) {
+                    continue;
+                }
+            }
+
+            key_count += 1;
+        }
+
+        var header_buffer: [32]u8 = undefined;
+        const header = try std.fmt.bufPrint(&header_buffer, "*{d}\r\n", .{key_count});
+        try stream.writeAll(header);
+
+        for (self.entries.items) |entry| {
+            if (entry.expires_at_ms) |expires_at_ms| {
+                if (std.time.milliTimestamp() >= expires_at_ms) {
+                    continue;
+                }
+            }
+
+            try writeBulkString(stream, entry.key);
+        }
+    }
+
     fn incr(self: *Database, key: []const u8) !i64 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -827,6 +862,7 @@ pub fn main() !void {
 
     const address = try net.Address.resolveIp("127.0.0.1", port);
     var database = Database.init(allocator);
+    try loadRdbFromConfig(allocator, &database, config);
     var replicas = ReplicaRegistry.init(allocator);
 
     var listener = try address.listen(.{
@@ -1187,6 +1223,11 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (should_reply) {
             try writeBulkString(stream, value);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "keys")) {
+        if (command.arg_count < 1) return;
+        if (should_reply) {
+            try database.writeKeys(stream, command.args[0]);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
         if (command.arg_count < 1) return;
         const key = command.args[0];
@@ -1485,6 +1526,146 @@ fn writeEmptyRdb(stream: anytype) !void {
     const header = try std.fmt.bufPrint(&header_buffer, "${d}\r\n", .{rdb.len});
     try stream.writeAll(header);
     try stream.writeAll(rdb);
+}
+
+fn loadRdbFromConfig(allocator: std.mem.Allocator, database: *Database, config: ServerConfig) !void {
+    if (config.dir.len == 0 or config.dbfilename.len == 0) {
+        return;
+    }
+
+    const rdb_path = try std.fs.path.join(allocator, &.{ config.dir, config.dbfilename });
+    defer allocator.free(rdb_path);
+
+    const file_contents = std.fs.cwd().readFileAlloc(allocator, rdb_path, 64 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(file_contents);
+
+    try parseRdb(database, file_contents);
+}
+
+fn parseRdb(database: *Database, file_contents: []const u8) !void {
+    if (file_contents.len < 9 or !std.mem.eql(u8, file_contents[0..5], "REDIS")) {
+        return error.InvalidRdbFile;
+    }
+
+    var index: usize = 9;
+    var expires_at_ms: ?i64 = null;
+
+    while (index < file_contents.len) {
+        const opcode = file_contents[index];
+        index += 1;
+
+        switch (opcode) {
+            0xFA => {
+                _ = try readRdbString(file_contents, &index);
+                _ = try readRdbString(file_contents, &index);
+            },
+            0xFB => {
+                _ = try readRdbLength(file_contents, &index);
+                _ = try readRdbLength(file_contents, &index);
+            },
+            0xFC => {
+                expires_at_ms = @bitCast(try readRdbInt(u64, file_contents, &index, .little));
+            },
+            0xFD => {
+                const expires_at_seconds = try readRdbInt(u32, file_contents, &index, .little);
+                expires_at_ms = @as(i64, expires_at_seconds) * 1000;
+            },
+            0xFE => {
+                _ = try readRdbLength(file_contents, &index);
+            },
+            0xFF => break,
+            0x00 => {
+                const key = try readRdbString(file_contents, &index);
+                const value = try readRdbString(file_contents, &index);
+                try database.set(key, value, expires_at_ms);
+                expires_at_ms = null;
+            },
+            else => return error.UnsupportedRdbValueType,
+        }
+    }
+}
+
+fn readRdbLength(file_contents: []const u8, index: *usize) !usize {
+    if (index.* >= file_contents.len) {
+        return error.InvalidRdbFile;
+    }
+
+    const first_byte = file_contents[index.*];
+    index.* += 1;
+
+    return switch (first_byte >> 6) {
+        0b00 => first_byte & 0x3F,
+        0b01 => blk: {
+            if (index.* >= file_contents.len) {
+                return error.InvalidRdbFile;
+            }
+
+            const value = (@as(usize, first_byte & 0x3F) << 8) | file_contents[index.*];
+            index.* += 1;
+            break :blk value;
+        },
+        0b10 => blk: {
+            const value = try readRdbInt(u32, file_contents, index, .big);
+            break :blk value;
+        },
+        0b11 => return error.UnsupportedRdbLengthEncoding,
+    };
+}
+
+fn readRdbString(file_contents: []const u8, index: *usize) ![]const u8 {
+    if (index.* >= file_contents.len) {
+        return error.InvalidRdbFile;
+    }
+
+    const first_byte = file_contents[index.*];
+    const encoding_type = first_byte >> 6;
+    if (encoding_type != 0b11) {
+        const string_len = try readRdbLength(file_contents, index);
+        const string_start = index.*;
+        const string_end = string_start + string_len;
+        if (string_end > file_contents.len) {
+            return error.InvalidRdbFile;
+        }
+
+        index.* = string_end;
+        return file_contents[string_start..string_end];
+    }
+
+    index.* += 1;
+    return switch (first_byte & 0x3F) {
+        0 => blk: {
+            const value = try readRdbInt(i8, file_contents, index, .little);
+            break :blk try formatRdbIntegerString(value);
+        },
+        1 => blk: {
+            const value = try readRdbInt(i16, file_contents, index, .little);
+            break :blk try formatRdbIntegerString(value);
+        },
+        2 => blk: {
+            const value = try readRdbInt(i32, file_contents, index, .little);
+            break :blk try formatRdbIntegerString(value);
+        },
+        else => return error.UnsupportedRdbStringEncoding,
+    };
+}
+
+fn formatRdbIntegerString(value: anytype) ![]const u8 {
+    return std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{value});
+}
+
+fn readRdbInt(comptime T: type, file_contents: []const u8, index: *usize, endian: std.builtin.Endian) !T {
+    const byte_len = @sizeOf(T);
+    const value_start = index.*;
+    const value_end = value_start + byte_len;
+    if (value_end > file_contents.len) {
+        return error.InvalidRdbFile;
+    }
+
+    index.* = value_end;
+    return std.mem.readInt(T, file_contents[value_start..value_end], endian);
 }
 
 fn parseNextCommand(data: []const u8) error{ Incomplete, Invalid }!ParsedCommand {
