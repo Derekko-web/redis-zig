@@ -68,6 +68,13 @@ const ReplicaRegistry = struct {
             index += 1;
         }
     }
+
+    fn count(self: *ReplicaRegistry) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        return self.streams.items.len;
+    }
 };
 
 const RespCommand = struct {
@@ -1007,7 +1014,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         _ = std.fmt.parseInt(u64, command.args[1], 10) catch return;
 
         if (should_reply) {
-            try stream.writeAll(":0\r\n");
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{replicas.count()});
+            try stream.writeAll(integer);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "get")) {
         if (command.arg_count < 1) return;
