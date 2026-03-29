@@ -1732,6 +1732,12 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         } else {
             try stream.writeAll("*0\r\n");
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "acl")) {
+        if (command.arg_count < 1) return;
+        if (!std.ascii.eqlIgnoreCase(command.args[0], "whoami")) return;
+        if (should_reply) {
+            try writeBulkString(stream, "default");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
         const message = command.args[0];
