@@ -1175,7 +1175,13 @@ fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: 
 fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, subscriptions: *ClientSubscriptions, config: *const ServerConfig, role: ServerRole, command: RespCommand, should_reply: bool, replication_offset: u64) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
         if (should_reply) {
-            try stream.writeAll("+PONG\r\n");
+            if (subscriptions.count() > 0) {
+                try stream.writeAll("*2\r\n");
+                try writeBulkString(stream, "pong");
+                try writeBulkString(stream, "");
+            } else {
+                try stream.writeAll("+PONG\r\n");
+            }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
         if (!should_reply and role == .slave and command.arg_count >= 2 and
