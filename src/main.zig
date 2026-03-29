@@ -625,6 +625,20 @@ const Database = struct {
         return rank;
     }
 
+    fn zcard(self: *Database, key: []const u8) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var member_count: usize = 0;
+        for (self.zsets.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) {
+                member_count += 1;
+            }
+        }
+
+        return member_count;
+    }
+
     fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1649,6 +1663,14 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         const stop = std.fmt.parseInt(i64, command.args[2], 10) catch return;
         if (should_reply) {
             try database.writeZRange(stream, command.args[0], start, stop);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zcard")) {
+        if (command.arg_count < 1) return;
+
+        if (should_reply) {
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{database.zcard(command.args[0])});
+            try stream.writeAll(integer);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
