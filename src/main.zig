@@ -433,6 +433,7 @@ const ZSetEntry = struct {
     key: []u8,
     member: []u8,
     score: f64,
+    score_text: []u8,
 };
 
 const ZSetMemberView = struct {
@@ -576,7 +577,7 @@ const Database = struct {
         return 1;
     }
 
-    fn zadd(self: *Database, key: []const u8, score: f64, member: []const u8) !usize {
+    fn zadd(self: *Database, key: []const u8, score: f64, score_text: []const u8, member: []const u8) !usize {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -586,6 +587,8 @@ const Database = struct {
             }
 
             entry.score = score;
+            self.allocator.free(entry.score_text);
+            entry.score_text = try self.allocator.dupe(u8, score_text);
             return 0;
         }
 
@@ -593,6 +596,7 @@ const Database = struct {
             .key = try self.allocator.dupe(u8, key),
             .member = try self.allocator.dupe(u8, member),
             .score = score,
+            .score_text = try self.allocator.dupe(u8, score_text),
         });
 
         return 1;
@@ -637,6 +641,19 @@ const Database = struct {
         }
 
         return member_count;
+    }
+
+    fn zscore(self: *Database, key: []const u8, member: []const u8) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.zsets.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key) and std.mem.eql(u8, entry.member, member)) {
+                return entry.score_text;
+            }
+        }
+
+        return null;
     }
 
     fn writeZRange(self: *Database, stream: anytype, key: []const u8, start: i64, stop: i64) !void {
@@ -1629,8 +1646,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         var added_members: usize = 0;
         var arg_index: usize = 1;
         while (arg_index < command.arg_count) : (arg_index += 2) {
-            const score = std.fmt.parseFloat(f64, command.args[arg_index]) catch return;
-            added_members += try database.zadd(key, score, command.args[arg_index + 1]);
+            const score_text = command.args[arg_index];
+            const score = std.fmt.parseFloat(f64, score_text) catch return;
+            added_members += try database.zadd(key, score, score_text, command.args[arg_index + 1]);
         }
 
         if (should_reply) {
@@ -1671,6 +1689,19 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             var integer_buffer: [32]u8 = undefined;
             const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{database.zcard(command.args[0])});
             try stream.writeAll(integer);
+        }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "zscore")) {
+        if (command.arg_count < 2) return;
+
+        const score = database.zscore(command.args[0], command.args[1]) orelse {
+            if (should_reply) {
+                try stream.writeAll("$-1\r\n");
+            }
+            return;
+        };
+
+        if (should_reply) {
+            try writeBulkString(stream, score);
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
