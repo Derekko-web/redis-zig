@@ -446,6 +446,11 @@ const ZSetMemberView = struct {
     score: f64,
 };
 
+const GeoPosition = struct {
+    longitude: f64,
+    latitude: f64,
+};
+
 const StreamId = struct {
     milliseconds_time: u64,
     sequence_number: u64,
@@ -674,6 +679,19 @@ const Database = struct {
         for (self.zsets.items) |entry| {
             if (std.mem.eql(u8, entry.key, key) and std.mem.eql(u8, entry.member, member)) {
                 return entry.score_text;
+            }
+        }
+
+        return null;
+    }
+
+    fn zscoreValue(self: *Database, key: []const u8, member: []const u8) ?f64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (self.zsets.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key) and std.mem.eql(u8, entry.member, member)) {
+                return entry.score;
             }
         }
 
@@ -1448,6 +1466,23 @@ fn geoLocationScore(longitude: f64, latitude: f64) u64 {
     return interleave64(latitude_offset, longitude_offset);
 }
 
+fn geoPositionFromScore(score: u64) GeoPosition {
+    const decoded = deinterleave64(score);
+    const latitude_offset: u32 = @truncate(decoded);
+    const longitude_offset: u32 = @truncate(decoded >> 32);
+    const scale: f64 = @floatFromInt(@as(u64, 1) << geo_step_max);
+
+    const latitude_min = geo_lat_min + (@as(f64, @floatFromInt(latitude_offset)) / scale) * (geo_lat_max - geo_lat_min);
+    const latitude_max = geo_lat_min + (@as(f64, @floatFromInt(latitude_offset + 1)) / scale) * (geo_lat_max - geo_lat_min);
+    const longitude_min = geo_long_min + (@as(f64, @floatFromInt(longitude_offset)) / scale) * (geo_long_max - geo_long_min);
+    const longitude_max = geo_long_min + (@as(f64, @floatFromInt(longitude_offset + 1)) / scale) * (geo_long_max - geo_long_min);
+
+    return .{
+        .longitude = (longitude_min + longitude_max) / 2.0,
+        .latitude = (latitude_min + latitude_max) / 2.0,
+    };
+}
+
 fn interleave64(x_input: u32, y_input: u32) u64 {
     var x: u64 = x_input;
     var y: u64 = y_input;
@@ -1464,6 +1499,27 @@ fn interleave64(x_input: u32, y_input: u32) u64 {
     y = (y | (y << 1)) & 0x5555555555555555;
 
     return x | (y << 1);
+}
+
+fn deinterleave64(interleaved: u64) u64 {
+    var x = interleaved;
+    var y = interleaved >> 1;
+
+    x &= 0x5555555555555555;
+    y &= 0x5555555555555555;
+
+    x = (x | (x >> 1)) & 0x3333333333333333;
+    y = (y | (y >> 1)) & 0x3333333333333333;
+    x = (x | (x >> 2)) & 0x0F0F0F0F0F0F0F0F;
+    y = (y | (y >> 2)) & 0x0F0F0F0F0F0F0F0F;
+    x = (x | (x >> 4)) & 0x00FF00FF00FF00FF;
+    y = (y | (y >> 4)) & 0x00FF00FF00FF00FF;
+    x = (x | (x >> 8)) & 0x0000FFFF0000FFFF;
+    y = (y | (y >> 8)) & 0x0000FFFF0000FFFF;
+    x = (x | (x >> 16)) & 0x00000000FFFFFFFF;
+    y = (y | (y >> 16)) & 0x00000000FFFFFFFF;
+
+    return x | (y << 32);
 }
 
 fn readLine(stream: anytype, buffer: []u8) ![]const u8 {
@@ -1837,10 +1893,15 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
             const key = command.args[0];
             var arg_index: usize = 1;
             while (arg_index < command.arg_count) : (arg_index += 1) {
-                if (database.zscore(key, command.args[arg_index]) != null) {
+                if (database.zscoreValue(key, command.args[arg_index])) |score_value| {
+                    const position = geoPositionFromScore(@intFromFloat(score_value));
+                    var longitude_buffer: [64]u8 = undefined;
+                    var latitude_buffer: [64]u8 = undefined;
+                    const longitude_text = try std.fmt.bufPrint(&longitude_buffer, "{d}", .{position.longitude});
+                    const latitude_text = try std.fmt.bufPrint(&latitude_buffer, "{d}", .{position.latitude});
                     try stream.writeAll("*2\r\n");
-                    try writeBulkString(stream, "0");
-                    try writeBulkString(stream, "0");
+                    try writeBulkString(stream, longitude_text);
+                    try writeBulkString(stream, latitude_text);
                 } else {
                     try stream.writeAll("*-1\r\n");
                 }
