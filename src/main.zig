@@ -1165,6 +1165,13 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (should_reply) {
             try writeBulkString(stream, message);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "subscribe")) {
+        if (command.arg_count < 1 or !should_reply) return;
+
+        try stream.writeAll("*3\r\n");
+        try writeBulkString(stream, "subscribe");
+        try writeBulkString(stream, command.args[0]);
+        try stream.writeAll(":1\r\n");
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
         const key = command.args[0];
