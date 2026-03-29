@@ -1740,6 +1740,15 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (role == .master) {
             try replicas.propagate(command);
         }
+    } else if (std.ascii.eqlIgnoreCase(command.name, "geoadd")) {
+        if (command.arg_count < 4 or (command.arg_count - 1) % 3 != 0) return;
+
+        if (should_reply) {
+            const added_locations = (command.arg_count - 1) / 3;
+            var integer_buffer: [32]u8 = undefined;
+            const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{added_locations});
+            try stream.writeAll(integer);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "wait")) {
         if (command.arg_count < 2) return;
         const requested_replicas = std.fmt.parseInt(usize, command.args[0], 10) catch return;
