@@ -76,6 +76,11 @@ const RespCommand = struct {
     arg_count: usize,
 };
 
+const ParsedCommand = struct {
+    command: RespCommand,
+    bytes_consumed: usize,
+};
+
 const QueuedCommand = struct {
     name: []u8,
     args: std.ArrayList([]u8),
@@ -713,7 +718,7 @@ pub fn main() !void {
     defer listener.deinit();
 
     if (replicaof) |master| {
-        const replication_thread = try std.Thread.spawn(.{}, performReplicationHandshake, .{ allocator, master, port });
+        const replication_thread = try std.Thread.spawn(.{}, performReplicationHandshake, .{ allocator, master, port, &database, &replicas });
         replication_thread.detach();
     }
 
@@ -764,7 +769,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try client.stream.writeAll(header);
 
             for (queued_commands.items) |*queued_command| {
-                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand());
+                try executeCommand(&client.stream, database, replicas, role, queued_command.toRespCommand(), true);
             }
 
             clearQueuedCommands(database.allocator, &queued_commands);
@@ -781,7 +786,7 @@ fn handleConnection(connection: std.net.Server.Connection, database: *Database, 
             try queued_commands.append(database.allocator, try QueuedCommand.init(database.allocator, command));
             try client.stream.writeAll("+QUEUED\r\n");
         } else {
-            try executeCommand(&client.stream, database, replicas, role, command);
+            try executeCommand(&client.stream, database, replicas, role, command, true);
         }
     }
 }
@@ -793,7 +798,7 @@ fn clearQueuedCommands(allocator: std.mem.Allocator, queued_commands: *std.Array
     queued_commands.clearRetainingCapacity();
 }
 
-fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16) !void {
+fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, listening_port: u16, database: *Database, replicas: *ReplicaRegistry) !void {
     while (true) {
         var stream = net.tcpConnectToHost(allocator, master.host, master.port) catch {
             std.Thread.sleep(50 * std.time.ns_per_ms);
@@ -813,6 +818,9 @@ fn performReplicationHandshake(allocator: std.mem.Allocator, master: ReplicaOf, 
         try expectSimpleString(stream, "OK");
 
         try writeRespArrayCommand(stream, &.{ "PSYNC", "?", "-1" });
+        try expectFullResync(stream);
+        try skipRdbFile(stream);
+        try processReplicationStream(&stream, database, replicas);
         return;
     }
 }
@@ -839,42 +847,104 @@ fn writeRespCommand(stream: anytype, command: RespCommand) !void {
     }
 }
 
-fn expectSimpleString(stream: anytype, expected: []const u8) !void {
-    var line_buffer: [64]u8 = undefined;
+fn readLine(stream: anytype, buffer: []u8) ![]const u8 {
     var line_len: usize = 0;
 
     while (true) {
-        if (line_len == line_buffer.len) {
+        if (line_len == buffer.len) {
             return error.ReplicationResponseTooLong;
         }
 
-        const bytes_read = try stream.read(line_buffer[line_len .. line_len + 1]);
+        const bytes_read = try stream.read(buffer[line_len .. line_len + 1]);
         if (bytes_read == 0) {
             return error.UnexpectedEof;
         }
 
         line_len += bytes_read;
         if (line_len >= 2 and
-            line_buffer[line_len - 2] == '\r' and
-            line_buffer[line_len - 1] == '\n')
+            buffer[line_len - 2] == '\r' and
+            buffer[line_len - 1] == '\n')
         {
-            break;
+            return buffer[0 .. line_len - 2];
         }
     }
+}
 
+fn expectSimpleString(stream: anytype, expected: []const u8) !void {
+    var line_buffer: [64]u8 = undefined;
+    const line = try readLine(stream, &line_buffer);
     var expected_buffer: [64]u8 = undefined;
     const expected_line = try std.fmt.bufPrint(&expected_buffer, "+{s}", .{expected});
-    const line = line_buffer[0 .. line_len - 2];
     if (!std.mem.eql(u8, line, expected_line)) {
         return error.UnexpectedReplicationResponse;
     }
 }
 
-fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand) !void {
+fn expectFullResync(stream: anytype) !void {
+    var line_buffer: [128]u8 = undefined;
+    const line = try readLine(stream, &line_buffer);
+    if (!std.mem.startsWith(u8, line, "+FULLRESYNC ")) {
+        return error.UnexpectedReplicationResponse;
+    }
+}
+
+fn skipRdbFile(stream: anytype) !void {
+    var header_buffer: [64]u8 = undefined;
+    const header = try readLine(stream, &header_buffer);
+    if (header.len < 2 or header[0] != '$') {
+        return error.InvalidRdbTransfer;
+    }
+
+    var remaining = std.fmt.parseInt(usize, header[1..], 10) catch return error.InvalidRdbTransfer;
+    var buffer: [1024]u8 = undefined;
+    while (remaining > 0) {
+        const chunk_len = @min(remaining, buffer.len);
+        const bytes_read = try stream.read(buffer[0..chunk_len]);
+        if (bytes_read == 0) {
+            return error.UnexpectedEof;
+        }
+
+        remaining -= bytes_read;
+    }
+}
+
+fn processReplicationStream(stream: *net.Stream, database: *Database, replicas: *ReplicaRegistry) !void {
+    var read_buffer: [1024]u8 = undefined;
+    var pending: std.ArrayList(u8) = .empty;
+    defer pending.deinit(database.allocator);
+
+    while (true) {
+        const bytes_read = stream.read(&read_buffer) catch 0;
+        if (bytes_read == 0) {
+            break;
+        }
+
+        try pending.appendSlice(database.allocator, read_buffer[0..bytes_read]);
+
+        while (true) {
+            const parsed = parseNextCommand(pending.items) catch |err| switch (err) {
+                error.Incomplete => break,
+                error.Invalid => return error.InvalidReplicationCommand,
+            };
+
+            try executeCommand(stream, database, replicas, .slave, parsed.command, false);
+
+            const remaining_len = pending.items.len - parsed.bytes_consumed;
+            std.mem.copyForwards(u8, pending.items[0..remaining_len], pending.items[parsed.bytes_consumed..]);
+            pending.shrinkRetainingCapacity(remaining_len);
+        }
+    }
+}
+
+fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegistry, role: ServerRole, command: RespCommand, should_reply: bool) !void {
     if (std.ascii.eqlIgnoreCase(command.name, "ping")) {
-        try stream.writeAll("+PONG\r\n");
+        if (should_reply) {
+            try stream.writeAll("+PONG\r\n");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "replconf")) {
-        try stream.writeAll("+OK\r\n");
+        if (should_reply) {
+            try stream.writeAll("+OK\r\n");
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "psync")) {
         var fullresync_buffer: [96]u8 = undefined;
         const fullresync = try std.fmt.bufPrint(&fullresync_buffer, "+FULLRESYNC {s} {d}\r\n", .{
@@ -886,12 +956,16 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         try replicas.register(stream);
     } else if (std.ascii.eqlIgnoreCase(command.name, "info")) {
         if (command.arg_count == 0 or std.ascii.eqlIgnoreCase(command.args[0], "replication")) {
-            try writeInfoReplication(stream, role);
+            if (should_reply) {
+                try writeInfoReplication(stream, role);
+            }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "echo")) {
         if (command.arg_count < 1) return;
         const message = command.args[0];
-        try writeBulkString(stream, message);
+        if (should_reply) {
+            try writeBulkString(stream, message);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "set")) {
         if (command.arg_count < 2) return;
         const key = command.args[0];
@@ -912,7 +986,9 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         }
 
         try database.set(key, value, expires_at_ms);
-        try stream.writeAll("+OK\r\n");
+        if (should_reply) {
+            try stream.writeAll("+OK\r\n");
+        }
         if (role == .master) {
             try replicas.propagate(command);
         }
@@ -920,17 +996,23 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
         if (command.arg_count < 1) return;
         const key = command.args[0];
         const value = database.get(key) orelse {
-            try stream.writeAll("$-1\r\n");
+            if (should_reply) {
+                try stream.writeAll("$-1\r\n");
+            }
             return;
         };
 
-        try writeBulkString(stream, value);
+        if (should_reply) {
+            try writeBulkString(stream, value);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "incr")) {
         if (command.arg_count < 1) return;
         const key = command.args[0];
         const new_number = database.incr(key) catch |err| switch (err) {
             error.InvalidInteger => {
-                try stream.writeAll("-ERR value is not an integer or out of range\r\n");
+                if (should_reply) {
+                    try stream.writeAll("-ERR value is not an integer or out of range\r\n");
+                }
                 return;
             },
             else => return err,
@@ -938,17 +1020,25 @@ fn executeCommand(stream: anytype, database: *Database, replicas: *ReplicaRegist
 
         var integer_buffer: [32]u8 = undefined;
         const integer = try std.fmt.bufPrint(&integer_buffer, ":{d}\r\n", .{new_number});
-        try stream.writeAll(integer);
+        if (should_reply) {
+            try stream.writeAll(integer);
+        }
     } else if (std.ascii.eqlIgnoreCase(command.name, "type")) {
         if (command.arg_count < 1) return;
         const key = command.args[0];
 
         if (database.isStream(key)) {
-            try stream.writeAll("+stream\r\n");
+            if (should_reply) {
+                try stream.writeAll("+stream\r\n");
+            }
         } else if (database.get(key) != null) {
-            try stream.writeAll("+string\r\n");
+            if (should_reply) {
+                try stream.writeAll("+string\r\n");
+            }
         } else {
-            try stream.writeAll("+none\r\n");
+            if (should_reply) {
+                try stream.writeAll("+none\r\n");
+            }
         }
     } else if (std.ascii.eqlIgnoreCase(command.name, "xadd")) {
         if (command.arg_count < 4) return;
@@ -1215,6 +1305,40 @@ fn writeEmptyRdb(stream: anytype) !void {
     try stream.writeAll(rdb);
 }
 
+fn parseNextCommand(data: []const u8) error{ Incomplete, Invalid }!ParsedCommand {
+    if (data.len == 0) {
+        return error.Incomplete;
+    }
+
+    if (data[0] != '*') {
+        return error.Invalid;
+    }
+
+    const array_header_end = findCrlf(data, 1) orelse return error.Incomplete;
+    const element_count = std.fmt.parseInt(usize, data[1..array_header_end], 10) catch return error.Invalid;
+    if (element_count == 0 or element_count - 1 > max_command_args) {
+        return error.Invalid;
+    }
+
+    var index = array_header_end + 2;
+    const name = try parseBulkStringAt(data, &index);
+    var args: [max_command_args][]const u8 = undefined;
+    var arg_count: usize = 0;
+
+    while (arg_count < element_count - 1) : (arg_count += 1) {
+        args[arg_count] = try parseBulkStringAt(data, &index);
+    }
+
+    return .{
+        .command = .{
+            .name = name,
+            .args = args,
+            .arg_count = arg_count,
+        },
+        .bytes_consumed = index,
+    };
+}
+
 fn parseCommand(data: []const u8) ?RespCommand {
     var lines = std.mem.splitSequence(u8, data, "\r\n");
 
@@ -1245,6 +1369,44 @@ fn parseCommand(data: []const u8) ?RespCommand {
         .args = args,
         .arg_count = arg_count,
     };
+}
+
+fn findCrlf(data: []const u8, start: usize) ?usize {
+    var index = start;
+    while (index + 1 < data.len) : (index += 1) {
+        if (data[index] == '\r' and data[index + 1] == '\n') {
+            return index;
+        }
+    }
+
+    return null;
+}
+
+fn parseBulkStringAt(data: []const u8, index: *usize) error{ Incomplete, Invalid }![]const u8 {
+    if (index.* >= data.len) {
+        return error.Incomplete;
+    }
+
+    if (data[index.*] != '$') {
+        return error.Invalid;
+    }
+
+    const header_start = index.* + 1;
+    const header_end = findCrlf(data, header_start) orelse return error.Incomplete;
+    const expected_len = std.fmt.parseInt(usize, data[header_start..header_end], 10) catch return error.Invalid;
+    const value_start = header_end + 2;
+    const value_end = value_start + expected_len;
+
+    if (value_end + 2 > data.len) {
+        return error.Incomplete;
+    }
+
+    if (data[value_end] != '\r' or data[value_end + 1] != '\n') {
+        return error.Invalid;
+    }
+
+    index.* = value_end + 2;
+    return data[value_start..value_end];
 }
 
 fn nextBulkString(lines: anytype) ?[]const u8 {
