@@ -1,33 +1,35 @@
-[![progress-banner](https://backend.codecrafters.io/progress/redis/d9d40a20-533f-4e45-803e-ae4df1ce4bc5)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
+# Redis-compatible server in Zig
 
-This is a starting point for Zig solutions to the
-["Build Your Own Redis" Challenge](https://codecrafters.io/challenges/redis).
+Maintained by **Derek Ko**.
 
-In this challenge, you'll build a toy Redis clone that's capable of handling
-basic commands like `PING`, `SET` and `GET`. Along the way we'll learn about
-event loops, the Redis protocol and more.
+An experimental in-memory server implementing a subset of the Redis protocol
+and command set in Zig.
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+## Features
 
-# Passing the first stage
+- RESP command parsing and concurrent client connections
+- Strings, lists, sorted sets, streams, and geospatial operations
+- Key expiration, blocking reads, and transaction command queues
+- Publish/subscribe, authentication, and ACL commands
+- Replication handshake, command propagation, and replica acknowledgments
+- Loading supported RDB data from a configured file
 
-The entry point for your Redis implementation is in `src/main.zig`. Study and
-uncomment the relevant code, and push your changes to pass the first stage:
+## Build and run
+
+Requires Zig 0.15.1 or 0.15.2. Run the server on the default port, 6379:
 
 ```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
+./your_program.sh
 ```
 
-That's all!
+To use another port:
 
-# Stage 2 & beyond
+```sh
+./your_program.sh --port 6380
+```
 
-Note: This section is for stages 2 and beyond.
+Use `redis-cli -p 6380` to connect. Direct builds use `zig build`; the executable
+is `zig-out/bin/main`. Source code is in `src/main.zig`.
 
-1. Ensure you have `zig (0.15)` installed locally
-1. Run `./your_program.sh` to run your Redis server, which is implemented in
-   `src/main.zig`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+This implements a subset of Redis behavior and is intended for local
+experimentation. It is not a production Redis replacement.
